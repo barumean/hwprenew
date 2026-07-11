@@ -14,6 +14,8 @@
   - 1행 1열(한 칸) 표는 그림틀로 간주하여 그림틀 서식을 적용하고
     번호 종류(개체속성-기타)를 '그림'으로 바꿉니다.
   - 사진(그림 개체)의 번호 종류는 '없음'으로 바꿉니다.
+  - 규칙에 따라 표/그림틀/사진의 너비를 문서폭 또는 고정값으로 맞춥니다.
+    (사진은 가로세로 비율을 유지한 채 조절됩니다)
 
 전제 조건
   - Windows + 한글(한컴오피스) 설치
@@ -54,9 +56,15 @@ LINE_WIDTHS = {
 NUMBERING_TYPES = {"없음": 0, "그림": 1, "표": 2, "수식": 3}
 
 
+class 규칙오류(Exception):
+    pass
+
+
 def hex_to_hwp_color(hex_str: str) -> int:
     """'#RRGGBB' → 한글 내부 색상값(BGR 정수)"""
     s = hex_str.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", s):
+        raise 규칙오류(f"색 값이 잘못되었습니다: '{hex_str}' (\"#RRGGBB\" 형식, 예: \"#000000\")")
     r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
     return r + g * 256 + b * 65536
 
@@ -64,10 +72,6 @@ def hex_to_hwp_color(hex_str: str) -> int:
 def mm_to_hu(mm: float) -> int:
     """밀리미터 → HwpUnit (1인치 = 7200 HU = 25.4mm)"""
     return round(mm * 7200 / 25.4)
-
-
-class 규칙오류(Exception):
-    pass
 
 
 def parse_line_rule(d: dict, 이름: str) -> dict:
@@ -81,6 +85,15 @@ def parse_line_rule(d: dict, 이름: str) -> dict:
                      f"  허용 선 종류: {', '.join(LINE_TYPES)}\n"
                      f"  허용 선 굵기: {', '.join(LINE_WIDTHS)}")
     return {"type": 종류, "width": 굵기, "color": 색}
+
+
+def parse_numbering_rule(value, 이름: str) -> int:
+    """번호종류 값(없음/그림/표/수식) → 내부 정수값"""
+    s = str(value)
+    if s not in NUMBERING_TYPES:
+        raise 규칙오류(f"[{이름}] 번호종류 값이 잘못되었습니다: '{s}'\n"
+                     f"  허용 값: {', '.join(NUMBERING_TYPES)}")
+    return NUMBERING_TYPES[s]
 
 
 def parse_width_rule(value) -> dict:
@@ -134,16 +147,20 @@ def load_rules(config_path: Path) -> dict:
         "border": parse_line_rule(틀.get("테두리") or {"종류": "실선", "굵기": "0.1mm", "색": "#B3B3B3"},
                                   "그림틀.테두리"),
         "clear_bg": str(틀.get("배경", "지우기")) == "지우기",
-        "numbering": NUMBERING_TYPES.get(str(틀.get("번호종류", "그림"))),
+        "numbering": parse_numbering_rule(틀.get("번호종류", "그림"), "그림틀"),
         "width": parse_width_rule(틀.get("너비", "유지")),
     }
     # 사진(그림 개체) 규칙
     사진 = raw.get("사진") or {}
-    rules["photo_numbering"] = NUMBERING_TYPES.get(str(사진.get("번호종류", "없음")))
+    rules["photo_numbering"] = parse_numbering_rule(사진.get("번호종류", "없음"), "사진")
+    rules["photo_width"] = parse_width_rule(사진.get("너비", "유지"))
 
     # 개체 위치: 글자처럼 취급 (켬=1 / 끔=0 / 유지=None)
     개체 = raw.get("개체위치") or {}
-    rules["treat_as_char"] = {"켬": 1, "끔": 0}.get(str(개체.get("글자처럼취급", "유지")))
+    취급 = str(개체.get("글자처럼취급", "유지"))
+    if 취급 not in ("켬", "끔", "유지"):
+        raise 규칙오류(f"[개체위치] 글자처럼취급 값이 잘못되었습니다: '{취급}' (허용: 켬, 끔, 유지)")
+    rules["treat_as_char"] = {"켬": 1, "끔": 0}.get(취급)
 
     # 스타일 정리
     스타일 = raw.get("스타일정리") or {}
@@ -180,9 +197,9 @@ class TableSpec:
         return self.n_rows == 1 and self.n_cols == 1
 
 
-def analyze_tables(hwp, work_dir: Path) -> list:
+def analyze_tables(hwp, src: Path) -> list:
     """열려 있는 문서를 임시 hwpx로 저장해 표 구조 목록을 만든다(문서 순서)."""
-    tmp = work_dir / "_표정리_분석용.hwpx"
+    tmp = src.parent / "_표정리_분석용.hwpx"
     if tmp.exists():
         tmp.unlink()
     if not hwp.save_as(str(tmp), format="HWPX"):
@@ -197,10 +214,15 @@ def analyze_tables(hwp, work_dir: Path) -> list:
                     specs.append(TableSpec(tbl))
         return specs
     finally:
+        # save_as 이후에는 임시 파일이 '현재 문서'가 되어 잠겨 있으므로
+        # 원본을 다시 열어 잠금을 풀고 임시 파일을 지운다.
+        reopened = hwp.open(str(src))
         try:
             tmp.unlink()
         except OSError:
             pass
+        if not reopened:
+            raise RuntimeError("분석 후 원본 문서를 다시 열지 못했습니다.")
 
 
 # ------------------------------------------------------------------
@@ -224,9 +246,11 @@ def intended_left_color(spec, addr, rules):
     return f"#{v & 255:02X}{(v >> 8) & 255:02X}{(v >> 16) & 255:02X}"
 
 
-def compute_left_patches(hwpx_path: Path, rules) -> dict:
-    """hwpx를 읽어 '테두리정의 id → 올바른 왼쪽 선 색' 목록을 만든다."""
+def compute_left_patches(hwpx_path: Path, rules, skip_idx=frozenset()) -> dict:
+    """hwpx를 읽어 '테두리정의 id → 올바른 왼쪽 선 색' 목록을 만든다.
+    skip_idx: 서식 적용에 실패해 건너뛴 표의 순번(0-기준) — 색 보정도 하지 않는다."""
     patches, conflicts = {}, set()
+    tbl_idx = -1
     with zipfile.ZipFile(hwpx_path) as z:
         header = ET.fromstring(z.read("Contents/header.xml"))
         HH = "{http://www.hancom.co.kr/hwpml/2011/head}"
@@ -239,6 +263,9 @@ def compute_left_patches(hwpx_path: Path, rules) -> dict:
                            if re.fullmatch(r"Contents/section\d+\.xml", n)):
             section = ET.fromstring(z.read(name))
             for tbl in section.iter(f"{HP}tbl"):
+                tbl_idx += 1
+                if tbl_idx in skip_idx:
+                    continue
                 spec = TableSpec(tbl)
                 for tr in tbl.findall(f"{HP}tr"):
                     for tc in tr.findall(f"{HP}tc"):
@@ -269,9 +296,17 @@ def patch_left_colors(hwpx_path: Path, patches: dict) -> None:
         text = data.decode("utf-8")
         for bf_id, color in patches.items():
             pattern = (r'(<hh:borderFill[^>]*\bid="' + re.escape(bf_id)
-                       + r'"[^>]*>.*?<hh:leftBorder[^>]*\bcolor=")[^"]*(")')
-            text = re.sub(pattern, lambda m: m.group(1) + color + m.group(2),
-                          text, count=1, flags=re.S)
+                       + r'"[^>]*>.*?)(<hh:leftBorder\b[^>]*?)(\s*/?>)')
+
+            def repl(m, color=color):
+                tag = m.group(2)
+                if 'color="' in tag:
+                    tag = re.sub(r'color="[^"]*"', f'color="{color}"', tag, count=1)
+                else:
+                    tag += f' color="{color}"'
+                return m.group(1) + tag + m.group(3)
+
+            text = re.sub(pattern, repl, text, count=1, flags=re.S)
         entries[i] = (info, text.encode("utf-8"))
     with zipfile.ZipFile(hwpx_path, "w") as z:
         for info, data in entries:
@@ -301,7 +336,8 @@ def remove_x_styles_in_hwpx(hwpx_path: Path) -> list:
     if not m:
         return []
 
-    tags = re.findall(r'<hh:style\b[^>]*/>', m.group(2))
+    tags = re.findall(r'<hh:style\b[^>]*/>|<hh:style\b[^>]*>.*?</hh:style>',
+                      m.group(2), re.S)
     kept = []
     for tag in tags:
         sid = re.search(r'\bid="(\d+)"', tag).group(1)
@@ -445,7 +481,8 @@ def cell_plan(spec: TableSpec, addr, rules):
     """셀 하나가 가져야 할 테두리/배경 계산"""
     r, c = addr
     rs, cs = spec.cells.get(addr, (1, 1))
-    h = rules["header_rows"]
+    # 본문 행이 하나도 안 남는 표(예: 1행짜리)는 머리글 처리를 하지 않는다
+    h = rules["header_rows"] if spec.n_rows > rules["header_rows"] else 0
     outer, inner, hb = rules["outer"], rules["inner"], rules["header_bottom"]
 
     sides = {}
@@ -479,12 +516,17 @@ def set_numbering_type(ctrl, value: int) -> bool:
 
 
 def get_edit_width(hwp) -> int:
-    """편집 영역 폭(HwpUnit) = 용지폭 - 좌여백 - 우여백"""
+    """편집 영역 폭(HwpUnit) = 용지폭 - 좌여백 - 우여백 - 제본여백"""
     act = hwp.hwp.CreateAction("PageSetup")
     pset = act.CreateSet()
     act.GetDefault(pset)
     pd = pset.Item("PageDef")
-    return pd.Item("PaperWidth") - pd.Item("LeftMargin") - pd.Item("RightMargin")
+    try:
+        gutter = pd.Item("GutterLen")
+    except Exception:
+        gutter = 0
+    return (pd.Item("PaperWidth") - pd.Item("LeftMargin")
+            - pd.Item("RightMargin") - gutter)
 
 
 def resize_table(ctrl, target_hu: int) -> bool:
@@ -497,9 +539,28 @@ def resize_table(ctrl, target_hu: int) -> bool:
     return True
 
 
+def resize_picture(ctrl, target_hu: int) -> bool:
+    """그림 개체의 너비를 target_hu로 변경(높이는 원래 비율 유지). 변경 시 True."""
+    props = ctrl.Properties
+    cur_w = props.Item("Width")
+    cur_h = props.Item("Height")
+    if not cur_w or cur_w == target_hu:
+        return False
+    props.SetItem("Width", target_hu)
+    props.SetItem("Height", round(cur_h * target_hu / cur_w))
+    ctrl.Properties = props
+    return True
+
+
 def format_frame(hwp, ctrl, rules) -> None:
     """1x1 그림틀: 테두리/배경 정리 + 번호 종류를 '그림'으로"""
     frame = rules["frame"]
+    enter_table(hwp, ctrl)
+    # 분석(XML) 순서와 컨트롤 순서가 어긋났을 때 큰 표를 그림틀로
+    # 오인해 첫 셀만 서식이 바뀌는 사고 방지 — 실제 1x1인지 확인
+    addrs = list(walk_cells(hwp, 8))
+    if addrs != [(0, 0)]:
+        raise RuntimeError(f"1x1 표가 아닙니다(셀 {addrs}) — 분석 결과와 불일치")
     enter_table(hwp, ctrl)
     sides = {s: frame["border"] for s in ("Left", "Right", "Top", "Bottom")}
     apply_cell(hwp, sides, "clear" if frame["clear_bg"] else None)
@@ -558,7 +619,7 @@ def process(src: Path) -> Path:
         if not hwp.open(str(src)):
             raise RuntimeError("문서를 열 수 없습니다. (암호/배포용 문서이거나 다른 프로그램에서 사용 중일 수 있습니다)")
 
-        specs = analyze_tables(hwp, src.parent)
+        specs = analyze_tables(hwp, src)
         ctrls = collect_tables(hwp)
         if len(specs) != len(ctrls):
             raise RuntimeError(f"표 개수 불일치(분석 {len(specs)} vs 문서 {len(ctrls)}) — 처리를 중단합니다.")
@@ -566,19 +627,23 @@ def process(src: Path) -> Path:
 
         # 너비 조절 목표값 계산
         edit_w = None
-        tw, fw = rules["table_width"], rules["frame"]["width"]
-        if tw["mode"] == "doc_width" or fw["mode"] == "doc_width":
+        tw, fw, pw = rules["table_width"], rules["frame"]["width"], rules["photo_width"]
+        if "doc_width" in (tw["mode"], fw["mode"], pw["mode"]):
             edit_w = get_edit_width(hwp)
             edit_mm = round(edit_w * 25.4 / 7200, 1)
             print(f"편집 영역 폭: {edit_mm}mm")
-        table_target = (edit_w if tw["mode"] == "doc_width"
-                        else mm_to_hu(tw["mm"]) if tw["mode"] == "fixed"
-                        else None)
-        frame_target = (edit_w if fw["mode"] == "doc_width"
-                        else mm_to_hu(fw["mm"]) if fw["mode"] == "fixed"
-                        else None)
+
+        def width_target(rule):
+            return (edit_w if rule["mode"] == "doc_width"
+                    else mm_to_hu(rule["mm"]) if rule["mode"] == "fixed"
+                    else None)
+
+        table_target = width_target(tw)
+        frame_target = width_target(fw)
+        photo_target = width_target(pw)
 
         done = frames = resized = failed = 0
+        failed_idx = set()              # 실패한 표의 순번(0-기준) — 후처리에서 제외
         for i, (ctrl, spec) in enumerate(zip(ctrls, specs), start=1):
             label = f"[{i}/{len(ctrls)}] {spec.n_rows}행x{spec.n_cols}열"
             try:
@@ -601,10 +666,11 @@ def process(src: Path) -> Path:
                 print(f"  {label} — 셀 {n}개 정리 완료" + ("＋너비조절" if w_ok else ""))
             except Exception as e:
                 failed += 1
+                failed_idx.add(i - 1)
                 print(f"  {label} — 실패({e}) → 건너뜀")
 
-        # 개체 공통 속성 정리: 사진 번호종류 + 글자처럼 취급(표/그림)
-        photos = tac_changed = 0
+        # 개체 공통 속성 정리: 사진 번호종류·너비 + 글자처럼 취급(표/그림)
+        photos = photos_resized = tac_changed = 0
         tac = rules["treat_as_char"]
         ctrl = hwp.HeadCtrl
         while ctrl:
@@ -613,6 +679,9 @@ def process(src: Path) -> Path:
                 if is_pic and rules["photo_numbering"] is not None:
                     if set_numbering_type(ctrl, rules["photo_numbering"]):
                         photos += 1
+                if is_pic and photo_target is not None:
+                    if resize_picture(ctrl, photo_target):
+                        photos_resized += 1
                 if tac is not None and (ctrl.CtrlID == "tbl" or is_pic):
                     props = ctrl.Properties
                     if props.Item("TreatAsChar") != tac:
@@ -624,6 +693,8 @@ def process(src: Path) -> Path:
             ctrl = ctrl.Next
         if photos:
             print(f"  사진 {photos}개 — 번호종류: 없음 적용")
+        if photos_resized:
+            print(f"  사진 {photos_resized}개 — 너비 조절(비율 유지)")
         if tac_changed:
             print(f"  개체 {tac_changed}개 — 글자처럼 취급 {'체크' if tac == 1 else '해제'}")
 
@@ -634,7 +705,7 @@ def process(src: Path) -> Path:
         if not hwp.save_as(str(tmp2), format="HWPX"):
             raise RuntimeError("후처리용 임시 저장에 실패했습니다.")
         try:
-            patches = compute_left_patches(tmp2, rules)
+            patches = compute_left_patches(tmp2, rules, failed_idx)
             hwp.HAction.Run("FileNew")      # 임시 파일 잠금 해제
             if patches:
                 patch_left_colors(tmp2, patches)
