@@ -5,6 +5,9 @@
 사용법
   1) 더블클릭 실행           → 파일 선택 창이 열립니다.
   2) python 표정리.py 문서.hwp → 지정한 문서를 정리합니다.
+  3) python 표정리.py --보기 문서.hwp
+     → 한글 창을 띄운 채 실행합니다. 처리가 멈출 때 어떤 대화상자
+       (보안 승인, 암호 입력, 문서 복구 등)가 떠 있는지 확인하는 진단용.
 
 동작
   - 원본 문서는 절대 수정하지 않습니다.
@@ -601,7 +604,7 @@ def pick_file() -> str:
     return path
 
 
-def process(src: Path) -> Path:
+def process(src: Path, visible: bool = False) -> Path:
     from pyhwpx import Hwp
 
     rules = load_rules(Path(__file__).parent / "서식규칙.yaml")
@@ -609,16 +612,18 @@ def process(src: Path) -> Path:
     out = src.with_name(src.stem + "_정리본" + src.suffix)
     fmt = "HWPX" if src.suffix.lower() == ".hwpx" else "HWP"
 
-    print(f"문서 여는 중: {src.name}")
-    hwp = Hwp(visible=False)
+    print("한글 실행 중..." + (" (창 표시 모드)" if visible else ""), flush=True)
+    hwp = Hwp(visible=visible)
     try:
         try:
             hwp.hwp.SetMessageBoxMode(0x00010000)   # 대화상자 자동 처리
         except Exception:
             pass
+        print(f"문서 여는 중: {src.name}", flush=True)
         if not hwp.open(str(src)):
             raise RuntimeError("문서를 열 수 없습니다. (암호/배포용 문서이거나 다른 프로그램에서 사용 중일 수 있습니다)")
 
+        print("문서 열기 완료 — 표 구조 분석 중...", flush=True)
         specs = analyze_tables(hwp, src)
         ctrls = collect_tables(hwp)
         if len(specs) != len(ctrls):
@@ -734,9 +739,14 @@ def process(src: Path) -> Path:
 
 
 def main():
-    interactive = len(sys.argv) < 2
+    args = sys.argv[1:]
+    # --보기: 한글 창을 띄운 채 실행 (숨김 모드에서 멈출 때 어떤 대화상자가
+    #         떠 있는지 눈으로 확인하는 진단용)
+    visible = any(a in ("--보기", "--visible") for a in args)
+    args = [a for a in args if a not in ("--보기", "--visible")]
+    interactive = not args
     try:
-        src = sys.argv[1] if not interactive else pick_file()
+        src = args[0] if args else pick_file()
         if not src:
             print("파일이 선택되지 않았습니다.")
             return
@@ -744,7 +754,7 @@ def main():
         if not src.exists():
             print(f"파일이 없습니다: {src}")
             return
-        process(src)
+        process(src, visible=visible)
     except 규칙오류 as e:
         print(f"\n[서식규칙.yaml 오류]\n{e}")
     except Exception:
