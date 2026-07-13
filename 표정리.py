@@ -333,6 +333,36 @@ def patch_left_colors(hwpx_path: Path, patches: dict) -> None:
             z.writestr(info.filename, data, compress_type=info.compress_type)
 
 
+def report_widths(hwpx_path: Path, table_target, frame_target) -> None:
+    """저장된 hwpx에서 표 너비를 실측해 목표값과 대조한 결과를 출력한다.
+
+    (컨트롤 속성값이 아니라 실제 저장된 레이아웃 값을 읽으므로,
+    너비 적용이 겉으로만 성공한 경우까지 잡아낸다)"""
+    if table_target is None and frame_target is None:
+        return
+    total = bad = 0
+    with zipfile.ZipFile(hwpx_path) as z:
+        for name in sorted(n for n in z.namelist()
+                           if re.fullmatch(r"Contents/section\d+\.xml", n)):
+            section = ET.fromstring(z.read(name))
+            for tbl in section.iter(f"{HP}tbl"):
+                target = frame_target if TableSpec(tbl).is_1x1 else table_target
+                sz = tbl.find(f"{HP}sz")
+                if target is None or sz is None:
+                    continue
+                total += 1
+                if abs(int(sz.get("width")) - target) > WIDTH_TOL:
+                    bad += 1
+                    mm = round(int(sz.get("width")) * 25.4 / 7200, 1)
+                    print(f"  ⚠ 표 너비 불일치: 실측 {mm}mm "
+                          f"(목표 {round(target * 25.4 / 7200, 1)}mm)")
+    if total:
+        if bad:
+            print(f"  ⚠ 너비 실측 검증: 표 {total}개 중 {bad}개가 목표와 다릅니다")
+        else:
+            print(f"  너비 실측 검증: 표 {total}개 모두 목표 너비와 일치")
+
+
 # ------------------------------------------------------------------
 # x 스타일 제거 (엑셀 붙여넣기 잔재)
 #   이름이 x/X로 시작하는 스타일을 목록에서 삭제하고, 남은 스타일의
@@ -549,26 +579,49 @@ def get_edit_width(hwp) -> int:
             - pd.Item("RightMargin") - gutter)
 
 
+WIDTH_TOL = 14                                  # 너비 허용 오차(HwpUnit, ≈0.05mm)
+
+
 def resize_table(hwp, ctrl, target_hu: int) -> bool:
     """표 전체 너비를 target_hu(HwpUnit)로 변경. 실제 변경 시 True 반환.
 
-    주의: 표는 ctrl.Properties에 Width를 대입해도 적용되지 않는다
+    주의 1: 표는 ctrl.Properties에 Width를 대입해도 적용되지 않는다
     (표 너비는 열 너비의 합으로 레이아웃이 재계산됨 — 글자처럼취급
-    여부와 무관). 개체속성 대화상자와 같은 경로인 TablePropertyDialog
-    액션으로 적용해야 열 너비까지 비례 조절되며 실제로 반영된다."""
-    if ctrl.Properties.Item("Width") == target_hu:
+    여부와 무관). 개체속성 대화상자 경로(TablePropertyDialog)로 적용한다.
+    주의 2: 캐럿이 셀 안에 있으면 이 대화상자의 크기 항목은 기본적으로
+    '셀 크기'로 동작하므로, ShapeType=3(대상: 표)과 ShapeCellSize=0
+    (크기를 셀이 아닌 표 전체에 적용)을 명시해야 표가 실제로 커진다."""
+    def width_ok():
+        return abs(ctrl.Properties.Item("Width") - target_hu) <= WIDTH_TOL
+
+    if width_ok():
         return False
-    enter_table(hwp, ctrl)                      # 캐럿을 표 안으로
-    # 개체속성 대화상자의 현재값을 그대로 받아 너비만 바꿔 적용한다.
-    # (다른 항목까지 함께 지정하면 한글 내부 오류가 날 수 있음)
+
+    # 1차: 표/셀 속성 대화상자 액션 (크기 적용 대상 = 표 전체)
+    enter_table(hwp, ctrl)
     pset = hwp.HParameterSet.HShapeObject
     hwp.HAction.GetDefault("TablePropertyDialog", pset.HSet)
+    pset.HSet.SetItem("ShapeType", 3)           # 대상: 표
+    pset.HSet.SetItem("ShapeCellSize", 0)       # 0 = 셀 크기가 아닌 표 전체 크기
     pset.HSet.SetItem("Width", target_hu)
     hwp.HAction.Execute("TablePropertyDialog", pset.HSet)
-    if ctrl.Properties.Item("Width") != target_hu:
-        print("      ※ 너비가 목표값으로 적용되지 않았습니다(표 속성 액션 확인 필요)")
-        return False
-    return True
+    if width_ok():
+        return True
+
+    # 2차: pyhwpx가 제공하는 표 너비 조절 메서드 (버전에 따라 없을 수 있음)
+    fn = getattr(hwp, "set_table_width", None)
+    if fn is not None:
+        for value, unit in ((target_hu, "unit"), (target_hu * 25.4 / 7200, "mm")):
+            try:
+                enter_table(hwp, ctrl)
+                fn(value, as_=unit)
+            except Exception:
+                continue
+            if width_ok():
+                return True
+
+    print("      ※ 너비가 목표값으로 적용되지 않았습니다(표 속성 액션 실패)")
+    return False
 
 
 def resize_picture(ctrl, target_hu: int) -> bool:
@@ -738,6 +791,7 @@ def process(src: Path, visible: bool = False) -> Path:
             raise RuntimeError("후처리용 임시 저장에 실패했습니다.")
         try:
             patches = compute_left_patches(tmp2, rules, failed_idx)
+            report_widths(tmp2, table_target, frame_target)
             hwp.HAction.Run("FileNew")      # 임시 파일 잠금 해제
             if patches:
                 patch_left_colors(tmp2, patches)
