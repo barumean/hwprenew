@@ -542,14 +542,10 @@ def resize_table(hwp, ctrl, target_hu: int) -> bool:
     if ctrl.Properties.Item("Width") == target_hu:
         return False
     enter_table(hwp, ctrl)                      # 캐럿을 표 안으로
+    # 개체속성 대화상자의 현재값을 그대로 받아 너비만 바꿔 적용한다.
+    # (다른 항목까지 함께 지정하면 한글 내부 오류가 날 수 있음)
     pset = hwp.HParameterSet.HShapeObject
     hwp.HAction.GetDefault("TablePropertyDialog", pset.HSet)
-    pset.HSet.SetItem("ShapeType", 3)           # 3 = 표
-    try:
-        rel = hwp.hwp.WidthRel("Absolute")      # 너비 기준: 절대값
-    except Exception:
-        rel = 4                                 # absolute (오토메이션 문서 기준)
-    pset.HSet.SetItem("WidthRelTo", rel)
     pset.HSet.SetItem("Width", target_hu)
     hwp.HAction.Execute("TablePropertyDialog", pset.HSet)
     if ctrl.Properties.Item("Width") != target_hu:
@@ -695,8 +691,8 @@ def process(src: Path, visible: bool = False) -> Path:
         tac = rules["treat_as_char"]
         ctrl = hwp.HeadCtrl
         while ctrl:
-            is_pic = ctrl.UserDesc == "그림"
             try:
+                is_pic = ctrl.UserDesc == "그림"
                 if is_pic and rules["photo_numbering"] is not None:
                     if set_numbering_type(ctrl, rules["photo_numbering"]):
                         photos += 1
@@ -709,8 +705,8 @@ def process(src: Path, visible: bool = False) -> Path:
                         props.SetItem("TreatAsChar", tac)
                         ctrl.Properties = props
                         tac_changed += 1
-            except Exception:
-                print(f"  개체 속성 변경 실패({ctrl.UserDesc}) — 건너뜀")
+            except Exception as e:
+                print(f"  개체 속성 변경 실패({e}) — 건너뜀")
             ctrl = ctrl.Next
         if photos:
             print(f"  사진 {photos}개 — 번호종류: 없음 적용")
@@ -745,13 +741,18 @@ def process(src: Path, visible: bool = False) -> Path:
             try:
                 hwp.HAction.Run("FileNew")   # tmp2 잠금 해제 후 삭제
                 tmp2.unlink()
-            except OSError:
+            except Exception:
                 pass
         print(f"\n완료: 표 {done}개 / 그림틀 {frames}개 / 너비조절 {resized}개 / 사진 {photos}개 / 실패 {failed}개")
         print(f"저장 위치: {out}")
         return out
     finally:
-        hwp.quit()
+        # 종료 실패(한글 프로세스가 이미 죽은 경우 등)가 원래 오류를
+        # 가리지 않도록 보호한다.
+        try:
+            hwp.quit()
+        except Exception:
+            print("※ 한글 종료 중 오류(무시) — 남은 한글 프로세스는 작업 관리자에서 종료하세요")
 
 
 def main():
