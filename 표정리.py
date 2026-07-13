@@ -3,8 +3,12 @@
 표정리.py — 한글(HWP/HWPX) 문서 안의 모든 표 서식을 일괄 정리하는 프로그램
 
 사용법
-  1) 더블클릭 실행           → 파일 선택 창이 열립니다.
-  2) python 표정리.py 문서.hwp → 지정한 문서를 정리합니다.
+  1) 더블클릭 실행 → 실행 창이 열립니다.
+     [파일 추가]/[폴더 추가]로 문서를 모은 뒤 [실행]을 누르면
+     차례로 정리하며 로그를 보여줍니다.
+  2) python 표정리.py 문서1.hwp 문서2.hwpx 폴더 ...
+     → 나열한 파일과 폴더(바로 아래의 .hwp/.hwpx)를 일괄 처리합니다.
+       탐색기에서 파일들을 표정리.py 아이콘 위로 끌어다 놓아도 됩니다.
   3) python 표정리.py --보기 문서.hwp
      → 한글 창을 띄운 채 실행합니다. 처리가 멈출 때 어떤 대화상자
        (보안 승인, 암호 입력, 문서 복구 등)가 떠 있는지 확인하는 진단용.
@@ -673,17 +677,207 @@ def format_table(hwp, ctrl, spec: TableSpec, rules) -> int:
 # 실행
 # ------------------------------------------------------------------
 
-def pick_file() -> str:
+def pick_files() -> list:
+    """파일 선택 대화상자(다중 선택). 선택한 Path 목록을 반환."""
     import tkinter as tk
     from tkinter import filedialog
     root = tk.Tk()
     root.withdraw()
-    path = filedialog.askopenfilename(
+    paths = filedialog.askopenfilenames(
         title="표 서식을 정리할 한글 문서를 선택하세요",
         filetypes=[("한글 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")],
     )
     root.destroy()
-    return path
+    return [Path(p) for p in paths]
+
+
+def collect_targets(paths) -> list:
+    """파일/폴더가 섞인 목록을 실제 처리 대상 문서 목록으로 확장한다.
+
+    폴더는 바로 아래의 .hwp/.hwpx만 찾고(하위 폴더 제외), 이 프로그램이
+    만드는 결과물(_정리본)과 임시 파일(_표정리_*)은 건너뛴다.
+    직접 지정한 파일은 이름과 무관하게 그대로 존중한다."""
+    targets, seen = [], set()
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            found = [f for f in sorted(p.iterdir())
+                     if f.suffix.lower() in (".hwp", ".hwpx")
+                     and not f.stem.endswith("_정리본")
+                     and not f.name.startswith("_표정리_")]
+        else:
+            found = [p]
+        for f in found:
+            r = f.resolve()
+            if r not in seen:
+                seen.add(r)
+                targets.append(r)
+    return targets
+
+
+def run_batch(files, visible: bool = False) -> tuple:
+    """여러 문서를 차례로 처리한다. (성공, 실패) 개수를 반환."""
+    ok = fail = 0
+    many = len(files) > 1
+    for i, f in enumerate(files, 1):
+        if many:
+            print(f"\n━━━ [{i}/{len(files)}] {f.name} ━━━")
+        try:
+            if not f.exists():
+                raise FileNotFoundError(f"파일이 없습니다: {f}")
+            process(f, visible=visible)
+            ok += 1
+        except 규칙오류:
+            raise                       # 규칙 오류는 모든 문서 공통 → 즉시 중단
+        except Exception:
+            fail += 1
+            print(f"[오류] {f.name} 처리 실패:\n{traceback.format_exc()}")
+    if many:
+        print(f"\n배치 완료: 성공 {ok}개 / 실패 {fail}개")
+    return ok, fail
+
+
+def run_gui() -> None:
+    """실행 창: 파일/폴더를 모아 [실행]을 누르면 차례로 정리하고 로그를 보여준다."""
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    APP = "표 서식 일괄정리"
+    root = tk.Tk()
+    root.title(APP)
+    root.geometry("760x560")
+    root.minsize(560, 420)
+
+    files = []
+    q = queue.Queue()
+
+    btns = tk.Frame(root)
+    btns.pack(fill="x", padx=10, pady=(10, 4))
+
+    lb_frame = tk.Frame(root)
+    lb_frame.pack(fill="x", padx=10)
+    listbox = tk.Listbox(lb_frame, height=7, selectmode="extended")
+    sb1 = tk.Scrollbar(lb_frame, command=listbox.yview)
+    listbox.config(yscrollcommand=sb1.set)
+    listbox.pack(side="left", fill="both", expand=True)
+    sb1.pack(side="right", fill="y")
+
+    opt = tk.Frame(root)
+    opt.pack(fill="x", padx=10, pady=4)
+    show_hwp = tk.BooleanVar(value=False)
+    tk.Checkbutton(opt, text="한글 창 보기(진단용)", variable=show_hwp).pack(side="left")
+    run_btn = tk.Button(opt, text="실행", width=14)
+    run_btn.pack(side="right")
+
+    log_frame = tk.Frame(root)
+    log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+    log = tk.Text(log_frame, state="disabled", wrap="word")
+    sb2 = tk.Scrollbar(log_frame, command=log.yview)
+    log.config(yscrollcommand=sb2.set)
+    log.pack(side="left", fill="both", expand=True)
+    sb2.pack(side="right", fill="y")
+
+    def append_log(text):
+        log.config(state="normal")
+        log.insert("end", text)
+        log.see("end")
+        log.config(state="disabled")
+
+    def add_paths(paths):
+        for p in collect_targets(paths):
+            if p not in files:
+                files.append(p)
+                listbox.insert("end", str(p))
+
+    def add_files():
+        add_paths(filedialog.askopenfilenames(
+            title="정리할 한글 문서 선택",
+            filetypes=[("한글 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")]))
+
+    def add_folder():
+        d = filedialog.askdirectory(title="폴더를 고르면 그 안의 한글 문서를 모두 추가합니다")
+        if d:
+            before = len(files)
+            add_paths([d])
+            if len(files) == before:
+                messagebox.showinfo(APP, "폴더에서 한글 문서를 찾지 못했습니다.")
+
+    def remove_selected():
+        for i in reversed(listbox.curselection()):
+            listbox.delete(i)
+            del files[i]
+
+    def open_rules():
+        try:
+            os.startfile(Path(__file__).parent / "서식규칙.yaml")
+        except Exception as e:
+            messagebox.showerror(APP, f"규칙 파일을 열 수 없습니다:\n{e}")
+
+    side_btns = []
+    for text, cmd in (("파일 추가", add_files), ("폴더 추가", add_folder),
+                      ("선택 제거", remove_selected), ("서식 규칙 편집", open_rules)):
+        b = tk.Button(btns, text=text, command=cmd)
+        b.pack(side="left", padx=(0, 6))
+        side_btns.append(b)
+
+    def set_running(running):
+        state = "disabled" if running else "normal"
+        for b in side_btns:
+            b.config(state=state)
+        run_btn.config(state=state)
+
+    def worker(targets, visible):
+        class LogWriter:                     # print 출력을 로그 창으로 전달
+            def write(self, text):
+                q.put(text)
+            def flush(self):
+                pass
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = LogWriter()
+        try:
+            try:
+                import pythoncom             # COM은 스레드마다 초기화 필요
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+            run_batch(targets, visible)
+        except 규칙오류 as e:
+            print(f"\n[서식규칙.yaml 오류]\n{e}")
+        except Exception:
+            traceback.print_exc(file=sys.stdout)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            q.put(None)                      # 작업 종료 신호
+
+    def start():
+        if not files:
+            messagebox.showwarning(APP, "먼저 정리할 문서를 추가하세요.")
+            return
+        set_running(True)
+        append_log("\n" + "=" * 46 + "\n")
+        threading.Thread(target=worker, args=(list(files), show_hwp.get()),
+                         daemon=True).start()
+
+    run_btn.config(command=start)
+
+    def poll():
+        try:
+            while True:
+                item = q.get_nowait()
+                if item is None:
+                    set_running(False)
+                else:
+                    append_log(item)
+        except queue.Empty:
+            pass
+        root.after(100, poll)
+
+    poll()
+    append_log("정리할 문서를 [파일 추가]/[폴더 추가]로 모은 뒤 [실행]을 누르세요.\n"
+               "결과는 원본과 같은 폴더에 '<이름>_정리본'으로 저장됩니다. (원본은 그대로)\n")
+    root.mainloop()
 
 
 def process(src: Path, visible: bool = False) -> Path:
@@ -824,34 +1018,50 @@ def process(src: Path, visible: bool = False) -> Path:
             print("※ 한글 종료 중 오류(무시) — 남은 한글 프로세스는 작업 관리자에서 종료하세요")
 
 
-def main():
-    args = sys.argv[1:]
-    # --보기: 한글 창을 띄운 채 실행 (숨김 모드에서 멈출 때 어떤 대화상자가
-    #         떠 있는지 눈으로 확인하는 진단용)
-    visible = any(a in ("--보기", "--visible") for a in args)
-    args = [a for a in args if a not in ("--보기", "--visible")]
-    interactive = not args
+def run_cli(paths, visible: bool) -> None:
+    """명령줄/파일선택 모드: 대상 목록을 확장해 일괄 처리하고 결과를 출력."""
     try:
-        src = args[0] if args else pick_file()
-        if not src:
-            print("파일이 선택되지 않았습니다.")
-            return
-        src = Path(src).resolve()
-        if not src.exists():
-            print(f"파일이 없습니다: {src}")
-            return
-        process(src, visible=visible)
+        targets = collect_targets(paths)
+        if not targets:
+            print("처리할 .hwp/.hwpx 문서를 찾지 못했습니다.")
+        else:
+            run_batch(targets, visible)
     except 규칙오류 as e:
         print(f"\n[서식규칙.yaml 오류]\n{e}")
     except Exception:
         print("\n[오류가 발생했습니다]")
         traceback.print_exc()
     finally:
-        if interactive:
-            try:
-                input("\n엔터 키를 누르면 창이 닫힙니다...")
-            except EOFError:
-                pass
+        # 더블클릭/드래그앤드롭 실행 시 창이 바로 닫혀 결과를 못 보는 것 방지
+        try:
+            input("\n엔터 키를 누르면 창이 닫힙니다...")
+        except EOFError:
+            pass
+
+
+def main():
+    args = sys.argv[1:]
+    # --보기: 한글 창을 띄운 채 실행 (숨김 모드에서 멈출 때 어떤 대화상자가
+    #         떠 있는지 눈으로 확인하는 진단용)
+    visible = any(a in ("--보기", "--visible") for a in args)
+    args = [a for a in args if a not in ("--보기", "--visible")]
+
+    if args:                            # 파일/폴더를 나열한 명령줄 모드
+        run_cli(args, visible)
+        return
+
+    # 인자 없음(더블클릭) → 실행 창. GUI를 띄울 수 없는 환경이면
+    # 파일 선택 대화상자로 대신한다.
+    try:
+        run_gui()
+        return
+    except Exception:
+        pass
+    picked = pick_files()
+    if not picked:
+        print("파일이 선택되지 않았습니다.")
+        return
+    run_cli(picked, visible)
 
 
 if __name__ == "__main__":
