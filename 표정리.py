@@ -532,13 +532,29 @@ def get_edit_width(hwp) -> int:
             - pd.Item("RightMargin") - gutter)
 
 
-def resize_table(ctrl, target_hu: int) -> bool:
-    """표 컨트롤의 너비를 target_hu(HwpUnit)로 변경. 변경 시 True 반환."""
-    props = ctrl.Properties
-    if props.Item("Width") == target_hu:
+def resize_table(hwp, ctrl, target_hu: int) -> bool:
+    """표 전체 너비를 target_hu(HwpUnit)로 변경. 실제 변경 시 True 반환.
+
+    주의: 표는 ctrl.Properties에 Width를 대입해도 적용되지 않는다
+    (표 너비는 열 너비의 합으로 레이아웃이 재계산됨 — 글자처럼취급
+    여부와 무관). 개체속성 대화상자와 같은 경로인 TablePropertyDialog
+    액션으로 적용해야 열 너비까지 비례 조절되며 실제로 반영된다."""
+    if ctrl.Properties.Item("Width") == target_hu:
         return False
-    props.SetItem("Width", target_hu)
-    ctrl.Properties = props
+    enter_table(hwp, ctrl)                      # 캐럿을 표 안으로
+    pset = hwp.HParameterSet.HShapeObject
+    hwp.HAction.GetDefault("TablePropertyDialog", pset.HSet)
+    pset.HSet.SetItem("ShapeType", 3)           # 3 = 표
+    try:
+        rel = hwp.hwp.WidthRel("Absolute")      # 너비 기준: 절대값
+    except Exception:
+        rel = 4                                 # absolute (오토메이션 문서 기준)
+    pset.HSet.SetItem("WidthRelTo", rel)
+    pset.HSet.SetItem("Width", target_hu)
+    hwp.HAction.Execute("TablePropertyDialog", pset.HSet)
+    if ctrl.Properties.Item("Width") != target_hu:
+        print("      ※ 너비가 목표값으로 적용되지 않았습니다(표 속성 액션 확인 필요)")
+        return False
     return True
 
 
@@ -657,14 +673,14 @@ def process(src: Path, visible: bool = False) -> Path:
                         print(f"  {label} — 그림틀 → 건너뜀(규칙)")
                     else:
                         format_frame(hwp, ctrl, rules)
-                        w_ok = frame_target is not None and resize_table(ctrl, frame_target)
+                        w_ok = frame_target is not None and resize_table(hwp, ctrl, frame_target)
                         if w_ok:
                             resized += 1
                         frames += 1
                         print(f"  {label} — 그림틀 서식 적용" + ("＋너비조절" if w_ok else ""))
                     continue
                 n = format_table(hwp, ctrl, spec, rules)
-                w_ok = table_target is not None and resize_table(ctrl, table_target)
+                w_ok = table_target is not None and resize_table(hwp, ctrl, table_target)
                 if w_ok:
                     resized += 1
                 done += 1
