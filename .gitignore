@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-_표정리_분석용.hwpx
-_표정리_후처리.hwpx
+_표정리_분석용*.hwpx
+_표정리_후처리*.hwpx
 *_정리본.hwp
 *_정리본.hwpx

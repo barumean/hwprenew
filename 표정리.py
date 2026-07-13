@@ -200,11 +200,28 @@ class TableSpec:
         return self.n_rows == 1 and self.n_cols == 1
 
 
+def make_temp_path(folder: Path, stem: str) -> Path:
+    """임시 hwpx 파일 경로를 만든다.
+
+    이전 실행이 비정상 종료하면 잔재 임시 파일이 좀비 한글 프로세스에
+    잠긴 채 남을 수 있다. 지울 수 있으면 지우고 재사용하되, 잠겨 있으면
+    실행을 중단하는 대신 번호를 붙인 다른 이름을 쓴다."""
+    for n in range(100):
+        p = folder / (stem + (str(n) if n else "") + ".hwpx")
+        if not p.exists():
+            return p
+        try:
+            p.unlink()
+            return p
+        except OSError:
+            print(f"  ※ 이전 실행의 임시 파일이 잠겨 있어 다른 이름 사용: {p.name}\n"
+                  f"     (작업 관리자에서 한글 프로세스 종료 후 직접 지워 주세요)")
+    raise RuntimeError("임시 파일 이름을 만들 수 없습니다.")
+
+
 def analyze_tables(hwp, src: Path) -> list:
     """열려 있는 문서를 임시 hwpx로 저장해 표 구조 목록을 만든다(문서 순서)."""
-    tmp = src.parent / "_표정리_분석용.hwpx"
-    if tmp.exists():
-        tmp.unlink()
+    tmp = make_temp_path(src.parent, "_표정리_분석용")
     if not hwp.save_as(str(tmp), format="HWPX"):
         raise RuntimeError("분석용 임시 저장에 실패했습니다.")
     try:
@@ -716,9 +733,7 @@ def process(src: Path, visible: bool = False) -> Path:
             print(f"  개체 {tac_changed}개 — 글자처럼 취급 {'체크' if tac == 1 else '해제'}")
 
         # 후처리 (hwpx 직접 수정): 왼쪽 테두리 색 보정 + x 스타일 제거
-        tmp2 = src.with_name("_표정리_후처리.hwpx")
-        if tmp2.exists():
-            tmp2.unlink()
+        tmp2 = make_temp_path(src.parent, "_표정리_후처리")
         if not hwp.save_as(str(tmp2), format="HWPX"):
             raise RuntimeError("후처리용 임시 저장에 실패했습니다.")
         try:
