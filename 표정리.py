@@ -33,6 +33,7 @@
 import os
 import re
 import sys
+import time
 import traceback
 import zipfile
 import xml.etree.ElementTree as ET
@@ -589,43 +590,31 @@ WIDTH_TOL = 14                                  # 너비 허용 오차(HwpUnit, 
 def resize_table(hwp, ctrl, target_hu: int) -> bool:
     """표 전체 너비를 target_hu(HwpUnit)로 변경. 실제 변경 시 True 반환.
 
-    주의 1: 표는 ctrl.Properties에 Width를 대입해도 적용되지 않는다
-    (표 너비는 열 너비의 합으로 레이아웃이 재계산됨 — 글자처럼취급
-    여부와 무관). 개체속성 대화상자 경로(TablePropertyDialog)로 적용한다.
-    주의 2: 캐럿이 셀 안에 있으면 이 대화상자의 크기 항목은 기본적으로
-    '셀 크기'로 동작하므로, ShapeType=3(대상: 표)과 ShapeCellSize=0
-    (크기를 셀이 아닌 표 전체에 적용)을 명시해야 표가 실제로 커진다."""
-    def width_ok():
-        return abs(ctrl.Properties.Item("Width") - target_hu) <= WIDTH_TOL
+    표의 너비는 ctrl.Properties의 Width 대입으로도, 표/셀 속성 액션의
+    Width 항목으로도 바뀌지 않는다(표 너비는 열 너비의 합으로 재계산됨).
+    유일하게 동작하는 방법은 pyhwpx의 set_table_width — 열 너비를
+    비율대로 고친 표를 같은 자리에 다시 넣는 방식이다.
 
-    if width_ok():
-        return False
-
-    # 1차: 표/셀 속성 대화상자 액션 (크기 적용 대상 = 표 전체)
+    주의: 재삽입 과정에서 기존 표 컨트롤이 삭제되므로, 이 함수를 부른
+    뒤에는 ctrl 참조를 절대 다시 사용하면 안 된다(죽은 참조)."""
     enter_table(hwp, ctrl)
-    pset = hwp.HParameterSet.HShapeObject
-    hwp.HAction.GetDefault("TablePropertyDialog", pset.HSet)
-    pset.HSet.SetItem("ShapeType", 3)           # 대상: 표
-    pset.HSet.SetItem("ShapeCellSize", 0)       # 0 = 셀 크기가 아닌 표 전체 크기
-    pset.HSet.SetItem("Width", target_hu)
-    hwp.HAction.Execute("TablePropertyDialog", pset.HSet)
-    if width_ok():
+    try:
+        cur = hwp.CellShape.Item("Width")       # 캐럿 기준 현재 표 너비
+    except Exception:
+        cur = None
+    if cur is not None and abs(cur - target_hu) <= WIDTH_TOL:
+        return False                            # 이미 목표 너비
+    if not hasattr(hwp, "set_table_width"):
+        print("      ※ 이 pyhwpx 버전에는 표 너비 조절 기능이 없습니다"
+              " → 명령창에서 pip install -U pyhwpx 실행")
+        return False
+    try:
+        hwp.set_table_width(target_hu, as_="hwpunit")
         return True
-
-    # 2차: pyhwpx가 제공하는 표 너비 조절 메서드 (버전에 따라 없을 수 있음)
-    fn = getattr(hwp, "set_table_width", None)
-    if fn is not None:
-        for value, unit in ((target_hu, "unit"), (target_hu * 25.4 / 7200, "mm")):
-            try:
-                enter_table(hwp, ctrl)
-                fn(value, as_=unit)
-            except Exception:
-                continue
-            if width_ok():
-                return True
-
-    print("      ※ 너비가 목표값으로 적용되지 않았습니다(표 속성 액션 실패)")
-    return False
+    except Exception as e:
+        # 너비 조절 실패는 표 서식(테두리/배경)과 무관 — 표를 실패로 만들지 않는다
+        print(f"      ※ 너비 조절 실패({type(e).__name__}: {e}) — 서식은 적용됨")
+        return False
 
 
 def resize_picture(ctrl, target_hu: int) -> bool:
@@ -889,7 +878,26 @@ def process(src: Path, visible: bool = False) -> Path:
     fmt = "HWPX" if src.suffix.lower() == ".hwpx" else "HWP"
 
     print("한글 실행 중..." + (" (창 표시 모드)" if visible else ""), flush=True)
-    hwp = Hwp(visible=visible)
+    # new=True: 사용자가 직접 열어 둔 한글 창이나 이전 실행의 잔재 인스턴스에
+    # 붙지 않도록 항상 독립된 새 인스턴스를 만든다. (기본값 new=False는 기존
+    # 창에 연결해 그 창을 숨기고 문서를 열고 마지막에 종료해 버린다)
+    # 한글이 떠 있지 않은 상태의 첫 실행은 초기화가 오래 걸려 연결이
+    # 실패할 수 있으므로 재시도한다.
+    hwp = None
+    for attempt in range(3):
+        if attempt:
+            print(f"  한글 연결 재시도 ({attempt}/2)...", flush=True)
+            time.sleep(3)
+        try:
+            hwp = Hwp(new=True, visible=visible)
+            break
+        except Exception as e:
+            last_err = e
+    if hwp is None:
+        raise RuntimeError(
+            f"한글을 실행하지 못했습니다: {last_err}\n"
+            "  한글(한컴오피스) 설치 여부와, 작업 관리자에 남아 있는 "
+            "한글 프로세스가 없는지 확인해 주세요.")
     try:
         try:
             hwp.hwp.SetMessageBoxMode(0x00010000)   # 대화상자 자동 처리
