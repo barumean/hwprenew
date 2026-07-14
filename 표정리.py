@@ -3,15 +3,18 @@
 표정리.py — 한글(HWP/HWPX) 문서 안의 모든 표 서식을 일괄 정리하는 프로그램
 
 사용법
-  1) 더블클릭 실행 → 실행 창이 열립니다.
-     [파일 추가]/[폴더 추가]로 문서를 모은 뒤 [실행]을 누르면
-     차례로 정리하며 로그를 보여줍니다.
+  1) 더블클릭 실행 → 작업창(GUI)이 열립니다.
+     (작업창.py 가 같은 폴더에 있으면 그 통합 UI로 연결됩니다.
+      없으면 파일 선택 창으로 대신 동작합니다.)
   2) python 표정리.py 문서1.hwp 문서2.hwpx 폴더 ...
      → 나열한 파일과 폴더(바로 아래의 .hwp/.hwpx)를 일괄 처리합니다.
        탐색기에서 파일들을 표정리.py 아이콘 위로 끌어다 놓아도 됩니다.
   3) python 표정리.py --보기 문서.hwp
      → 한글 창을 띄운 채 실행합니다. 처리가 멈출 때 어떤 대화상자
        (보안 승인, 암호 입력, 문서 복구 등)가 떠 있는지 확인하는 진단용.
+
+  ─ 이 파일(표정리.py)은 실제 처리를 담당하는 엔진 겸 명령줄 도구이며,
+    버튼 중심의 통합 작업창은 작업창.py 입니다. (python 작업창.py)
 
 동작
   - 원본 문서는 절대 수정하지 않습니다.
@@ -813,147 +816,17 @@ def run_batch(files, visible: bool = False) -> tuple:
     return ok, fail
 
 
-def run_gui() -> None:
-    """실행 창: 파일/폴더를 모아 [실행]을 누르면 차례로 정리하고 로그를 보여준다."""
-    import queue
-    import threading
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
+def launch_workwindow() -> bool:
+    """통합 작업창(작업창.py)을 별도 프로세스로 띄운다. 성공 시 True.
 
-    APP = "표 서식 일괄정리"
-    root = tk.Tk()
-    root.title(APP)
-    root.geometry("760x560")
-    root.minsize(560, 420)
-
-    files = []
-    q = queue.Queue()
-
-    btns = tk.Frame(root)
-    btns.pack(fill="x", padx=10, pady=(10, 4))
-
-    lb_frame = tk.Frame(root)
-    lb_frame.pack(fill="x", padx=10)
-    listbox = tk.Listbox(lb_frame, height=7, selectmode="extended")
-    sb1 = tk.Scrollbar(lb_frame, command=listbox.yview)
-    listbox.config(yscrollcommand=sb1.set)
-    listbox.pack(side="left", fill="both", expand=True)
-    sb1.pack(side="right", fill="y")
-
-    opt = tk.Frame(root)
-    opt.pack(fill="x", padx=10, pady=4)
-    show_hwp = tk.BooleanVar(value=False)
-    tk.Checkbutton(opt, text="한글 창 보기(진단용)", variable=show_hwp).pack(side="left")
-    run_btn = tk.Button(opt, text="실행", width=14)
-    run_btn.pack(side="right")
-
-    log_frame = tk.Frame(root)
-    log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-    log = tk.Text(log_frame, state="disabled", wrap="word")
-    sb2 = tk.Scrollbar(log_frame, command=log.yview)
-    log.config(yscrollcommand=sb2.set)
-    log.pack(side="left", fill="both", expand=True)
-    sb2.pack(side="right", fill="y")
-
-    def append_log(text):
-        log.config(state="normal")
-        log.insert("end", text)
-        log.see("end")
-        log.config(state="disabled")
-
-    def add_paths(paths):
-        for p in collect_targets(paths):
-            if p not in files:
-                files.append(p)
-                listbox.insert("end", str(p))
-
-    def add_files():
-        add_paths(filedialog.askopenfilenames(
-            title="정리할 한글 문서 선택",
-            filetypes=[("한글 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")]))
-
-    def add_folder():
-        d = filedialog.askdirectory(title="폴더를 고르면 그 안의 한글 문서를 모두 추가합니다")
-        if d:
-            before = len(files)
-            add_paths([d])
-            if len(files) == before:
-                messagebox.showinfo(APP, "폴더에서 한글 문서를 찾지 못했습니다.")
-
-    def remove_selected():
-        for i in reversed(listbox.curselection()):
-            listbox.delete(i)
-            del files[i]
-
-    def open_rules():
-        try:
-            os.startfile(Path(__file__).parent / "서식규칙.yaml")
-        except Exception as e:
-            messagebox.showerror(APP, f"규칙 파일을 열 수 없습니다:\n{e}")
-
-    side_btns = []
-    for text, cmd in (("파일 추가", add_files), ("폴더 추가", add_folder),
-                      ("선택 제거", remove_selected), ("서식 규칙 편집", open_rules)):
-        b = tk.Button(btns, text=text, command=cmd)
-        b.pack(side="left", padx=(0, 6))
-        side_btns.append(b)
-
-    def set_running(running):
-        state = "disabled" if running else "normal"
-        for b in side_btns:
-            b.config(state=state)
-        run_btn.config(state=state)
-
-    def worker(targets, visible):
-        class LogWriter:                     # print 출력을 로그 창으로 전달
-            def write(self, text):
-                q.put(text)
-            def flush(self):
-                pass
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = sys.stderr = LogWriter()
-        try:
-            try:
-                import pythoncom             # COM은 스레드마다 초기화 필요
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-            run_batch(targets, visible)
-        except 규칙오류 as e:
-            print(f"\n[서식규칙.yaml 오류]\n{e}")
-        except Exception:
-            traceback.print_exc(file=sys.stdout)
-        finally:
-            sys.stdout, sys.stderr = old_out, old_err
-            q.put(None)                      # 작업 종료 신호
-
-    def start():
-        if not files:
-            messagebox.showwarning(APP, "먼저 정리할 문서를 추가하세요.")
-            return
-        set_running(True)
-        append_log("\n" + "=" * 46 + "\n")
-        threading.Thread(target=worker, args=(list(files), show_hwp.get()),
-                         daemon=True).start()
-
-    run_btn.config(command=start)
-
-    def poll():
-        try:
-            while True:
-                item = q.get_nowait()
-                if item is None:
-                    set_running(False)
-                else:
-                    append_log(item)
-        except queue.Empty:
-            pass
-        root.after(100, poll)
-
-    poll()
-    append_log("정리할 문서를 [파일 추가]/[폴더 추가]로 모은 뒤 [실행]을 누르세요.\n"
-               "결과는 원본과 같은 폴더에 '<이름>_정리본'으로 저장됩니다. (원본은 그대로)\n")
-    root.mainloop()
+    작업창.py 가 표정리.py를 하위 프로세스로 호출하므로, 여기서는
+    작업창을 실행만 하고 이 프로세스는 곧바로 반환한다."""
+    import subprocess
+    work = Path(__file__).parent / "작업창.py"
+    if not work.exists():
+        return False
+    subprocess.Popen([sys.executable, str(work)], cwd=str(work.parent))
+    return True
 
 
 def process(src: Path, visible: bool = False) -> Path:
@@ -1137,12 +1010,14 @@ def run_cli(paths, visible: bool) -> None:
         print("\n[오류가 발생했습니다]")
         traceback.print_exc()
     finally:
-        # 더블클릭/드래그앤드롭 실행 시 창이 바로 닫혀 결과를 못 보는 것 방지
-        # (pythonw처럼 콘솔이 없는 환경에서는 input()이 RuntimeError를 냄)
-        try:
-            input("\n엔터 키를 누르면 창이 닫힙니다...")
-        except (EOFError, RuntimeError):
-            pass
+        # 더블클릭/드래그앤드롭 실행 시 창이 바로 닫혀 결과를 못 보는 것 방지.
+        # 단, 작업창.py 등이 하위 프로세스로 호출(출력이 파이프로 연결)한
+        # 경우에는 멈추지 않는다. (콘솔 없는 환경의 RuntimeError도 무시)
+        if sys.stdout.isatty():
+            try:
+                input("\n엔터 키를 누르면 창이 닫힙니다...")
+            except (EOFError, RuntimeError):
+                pass
 
 
 def main():
@@ -1156,13 +1031,13 @@ def main():
         run_cli(args, visible)
         return
 
-    # 인자 없음(더블클릭) → 실행 창. GUI를 띄울 수 없는 환경이면
-    # 파일 선택 대화상자로 대신한다.
+    # 인자 없음(더블클릭) → 통합 작업창(작업창.py)을 띄운다.
+    # 작업창.py 가 없거나 실행에 실패하면 파일 선택 대화상자로 대신한다.
     try:
-        run_gui()
-        return
+        if launch_workwindow():
+            return
     except Exception:
-        print("[실행 창을 띄우지 못했습니다 — 파일 선택 창으로 대신합니다]")
+        print("[작업창을 띄우지 못했습니다 — 파일 선택 창으로 대신합니다]")
         traceback.print_exc()
     picked = pick_files()
     if not picked:
