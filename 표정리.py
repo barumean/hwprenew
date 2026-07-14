@@ -123,6 +123,10 @@ def load_rules(config_path: Path) -> dict:
         raise 규칙오류(f"서식 규칙 파일을 찾을 수 없습니다: {config_path}")
     with open(config_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise 규칙오류(f"서식 규칙 파일의 형식이 잘못되었습니다: {config_path}")
     표 = raw.get("표서식") or {}
 
     바깥 = 표.get("바깥선") or {}
@@ -142,7 +146,11 @@ def load_rules(config_path: Path) -> dict:
     }
     머리글 = 표.get("머리글행") or {}
     if 머리글.get("사용", False):
-        rules["header_rows"] = int(머리글.get("행수", 1))
+        try:
+            rules["header_rows"] = int(머리글.get("행수", 1))
+        except (TypeError, ValueError):
+            raise 규칙오류(f"[머리글행] 행수 값이 잘못되었습니다: "
+                         f"'{머리글.get('행수')}' (숫자를 입력하세요)")
         rules["header_fill"] = hex_to_hwp_color(str(머리글.get("배경색", "#CCCCCC")))
         아래선 = 머리글.get("아래선")
         if 아래선:
@@ -224,6 +232,16 @@ def make_temp_path(folder: Path, stem: str) -> Path:
     raise RuntimeError("임시 파일 이름을 만들 수 없습니다.")
 
 
+def nested_tbl_ids(section) -> set:
+    """구역 XML에서 '표 안에 든 표'(중첩 표) 요소들의 id 집합을 만든다."""
+    nested = set()
+    for tbl in section.iter(f"{HP}tbl"):
+        for sub in tbl.iter(f"{HP}tbl"):
+            if sub is not tbl:
+                nested.add(id(sub))
+    return nested
+
+
 def analyze_tables(hwp, src: Path) -> list:
     """열려 있는 문서를 임시 hwpx로 저장해 표 구조 목록을 만든다(문서 순서)."""
     tmp = make_temp_path(src.parent, "_표정리_분석용")
@@ -235,8 +253,11 @@ def analyze_tables(hwp, src: Path) -> list:
             for name in sorted(n for n in z.namelist()
                                if re.fullmatch(r"Contents/section\d+\.xml", n)):
                 section = ET.fromstring(z.read(name))
+                nested = nested_tbl_ids(section)
                 for tbl in section.iter(f"{HP}tbl"):
-                    specs.append(TableSpec(tbl))
+                    spec = TableSpec(tbl)
+                    spec.nested = id(tbl) in nested   # 중첩 표는 너비 조절 제외
+                    specs.append(spec)
         return specs
     finally:
         # save_as 이후에는 임시 파일이 '현재 문서'가 되어 잠겨 있으므로
@@ -338,23 +359,42 @@ def patch_left_colors(hwpx_path: Path, patches: dict) -> None:
             z.writestr(info.filename, data, compress_type=info.compress_type)
 
 
-def report_widths(hwpx_path: Path, table_target, frame_target) -> None:
+def report_widths(hwpx_path: Path, table_target, frame_target,
+                  table_fit: bool = False, frame_fit: bool = False,
+                  frame_skip: bool = False, skip_idx=frozenset()) -> None:
     """저장된 hwpx에서 표 너비를 실측해 목표값과 대조한 결과를 출력한다.
 
     (컨트롤 속성값이 아니라 실제 저장된 레이아웃 값을 읽으므로,
-    너비 적용이 겉으로만 성공한 경우까지 잡아낸다)"""
+    너비 적용이 겉으로만 성공한 경우까지 잡아낸다)
+    - table_fit/frame_fit: 목표가 '문서폭'이면 표마다 바깥 여백을 빼고 비교
+    - frame_skip: 그림틀을 규칙상 건너뛰었으면 검사에서도 제외
+    - skip_idx: 서식 적용에 실패해 건너뛴 표 순번(0-기준) 제외
+    중첩 표(표 안의 표)는 너비 조절 대상이 아니므로 검사하지 않는다."""
     if table_target is None and frame_target is None:
         return
     total = bad = 0
+    tbl_idx = -1
     with zipfile.ZipFile(hwpx_path) as z:
         for name in sorted(n for n in z.namelist()
                            if re.fullmatch(r"Contents/section\d+\.xml", n)):
             section = ET.fromstring(z.read(name))
+            nested = nested_tbl_ids(section)
             for tbl in section.iter(f"{HP}tbl"):
-                target = frame_target if TableSpec(tbl).is_1x1 else table_target
+                tbl_idx += 1
+                if tbl_idx in skip_idx or id(tbl) in nested:
+                    continue
+                is_1x1 = TableSpec(tbl).is_1x1
+                if is_1x1 and frame_skip:
+                    continue
+                target = frame_target if is_1x1 else table_target
                 sz = tbl.find(f"{HP}sz")
                 if target is None or sz is None:
                     continue
+                if (frame_fit if is_1x1 else table_fit):
+                    om = tbl.find(f"{HP}outMargin")   # 표 바깥 여백만큼 좁아진다
+                    if om is not None:
+                        target -= (int(om.get("left", 0) or 0)
+                                   + int(om.get("right", 0) or 0))
                 total += 1
                 if abs(int(sz.get("width")) - target) > WIDTH_TOL:
                     bad += 1
@@ -584,32 +624,79 @@ def get_edit_width(hwp) -> int:
             - pd.Item("RightMargin") - gutter)
 
 
-WIDTH_TOL = 14                                  # 너비 허용 오차(HwpUnit, ≈0.05mm)
+WIDTH_TOL = 30                                  # 너비 허용 오차(HwpUnit, ≈0.1mm)
 
 
-def resize_table(hwp, ctrl, target_hu: int) -> bool:
+def resize_table(hwp, ctrl, target_hu: int, fit_doc: bool = False) -> bool:
     """표 전체 너비를 target_hu(HwpUnit)로 변경. 실제 변경 시 True 반환.
 
     표의 너비는 ctrl.Properties의 Width 대입으로도, 표/셀 속성 액션의
     Width 항목으로도 바뀌지 않는다(표 너비는 열 너비의 합으로 재계산됨).
-    유일하게 동작하는 방법은 pyhwpx의 set_table_width — 열 너비를
-    비율대로 고친 표를 같은 자리에 다시 넣는 방식이다.
+    동작하는 방법은 pyhwpx의 set_table_width와 같은 원리 — 표를 HWPML로
+    추출해 셀 너비를 비율대로 고친 뒤 같은 자리에 다시 넣는 것뿐이다.
+    (set_table_width를 직접 쓰지 않는 이유: 내부의 SelectCtrlFront
+    무한 루프가 그림이 든 그림틀에서 멈출 수 있어, 표 컨트롤을 직접
+    선택하는 유한 동작으로 재구현했다)
+
+    fit_doc: 목표가 '문서폭'이면 표 바깥 여백을 빼서 실제로 도달 가능한
+    값으로 보정한다.
 
     주의: 재삽입 과정에서 기존 표 컨트롤이 삭제되므로, 이 함수를 부른
     뒤에는 ctrl 참조를 절대 다시 사용하면 안 된다(죽은 참조)."""
     enter_table(hwp, ctrl)
+    if fit_doc:
+        try:
+            target_hu -= (hwp.get_table_outside_margin_left(as_="hwpunit")
+                          + hwp.get_table_outside_margin_right(as_="hwpunit"))
+        except Exception:
+            pass
     try:
         cur = hwp.CellShape.Item("Width")       # 캐럿 기준 현재 표 너비
     except Exception:
         cur = None
-    if cur is not None and abs(cur - target_hu) <= WIDTH_TOL:
-        return False                            # 이미 목표 너비
-    if not hasattr(hwp, "set_table_width"):
-        print("      ※ 이 pyhwpx 버전에는 표 너비 조절 기능이 없습니다"
-              " → 명령창에서 pip install -U pyhwpx 실행")
+    if not cur:
+        print("      ※ 현재 표 너비를 읽지 못해 너비 조절을 건너뜁니다")
         return False
+    if abs(cur - target_hu) <= WIDTH_TOL:
+        return False                            # 이미 목표 너비
     try:
-        hwp.set_table_width(target_hu, as_="hwpunit")
+        # 표 컨트롤을 직접 선택해 HWPML로 추출하고 셀 너비를 비율 조정
+        hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+        hwp.hwp.FindCtrl()                      # 개체 선택 상태
+        orig_text = hwp.GetTextFile("HWPML2X", "saveblock")
+        block = ET.fromstring(orig_text)
+        ratio = target_hu / cur
+        for cell in block.iter("CELL"):
+            w = cell.get("Width")
+            if w:
+                cell.set("Width", str(round(int(w) * ratio)))
+        new_text = ET.tostring(block, encoding="UTF-16").decode("utf-16")
+
+        # 조판 부호 표시 상태에서 삭제·삽입해야 위치가 정확하다 (pyhwpx 방식)
+        prop = hwp.ViewProperties
+        old_flag = prop.Item("OptionFlag")
+        if old_flag not in (2, 6):
+            prop.SetItem("OptionFlag", 6)
+            hwp.ViewProperties = prop
+        deleted = False
+        try:
+            hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+            hwp.hwp.FindCtrl()
+            hwp.HAction.Run("Delete")           # 이 시점부터 ctrl은 죽은 참조
+            deleted = True
+            hwp.SetTextFile(new_text, format="HWPML2X", option="insertfile")
+        except Exception:
+            if deleted:                         # 삽입 실패 → 원래 표로 복구
+                try:
+                    hwp.SetTextFile(orig_text, format="HWPML2X", option="insertfile")
+                    print("      ※ 너비 적용에 실패해 원래 표로 복구했습니다")
+                except Exception:
+                    print("      ⚠ 너비 조절 중 표 복구까지 실패 — 결과물에서 이 표를 꼭 확인하세요!")
+            raise
+        finally:
+            prop = hwp.ViewProperties
+            prop.SetItem("OptionFlag", old_flag)
+            hwp.ViewProperties = prop
         return True
     except Exception as e:
         # 너비 조절 실패는 표 서식(테두리/배경)과 무관 — 표를 실패로 만들지 않는다
@@ -936,19 +1023,25 @@ def process(src: Path, visible: bool = False) -> Path:
         for i, (ctrl, spec) in enumerate(zip(ctrls, specs), start=1):
             label = f"[{i}/{len(ctrls)}] {spec.n_rows}행x{spec.n_cols}열"
             try:
+                # 중첩 표(표 안의 표)는 부모 셀보다 넓힐 수 없으므로 너비 조절 제외
+                can_resize = not getattr(spec, "nested", False)
                 if spec.is_1x1:
                     if rules["frame"]["skip"]:
                         print(f"  {label} — 그림틀 → 건너뜀(규칙)")
                     else:
                         format_frame(hwp, ctrl, rules)
-                        w_ok = frame_target is not None and resize_table(hwp, ctrl, frame_target)
+                        w_ok = (can_resize and frame_target is not None
+                                and resize_table(hwp, ctrl, frame_target,
+                                                 fit_doc=fw["mode"] == "doc_width"))
                         if w_ok:
                             resized += 1
                         frames += 1
                         print(f"  {label} — 그림틀 서식 적용" + ("＋너비조절" if w_ok else ""))
                     continue
                 n = format_table(hwp, ctrl, spec, rules)
-                w_ok = table_target is not None and resize_table(hwp, ctrl, table_target)
+                w_ok = (can_resize and table_target is not None
+                        and resize_table(hwp, ctrl, table_target,
+                                         fit_doc=tw["mode"] == "doc_width"))
                 if w_ok:
                     resized += 1
                 done += 1
@@ -993,7 +1086,11 @@ def process(src: Path, visible: bool = False) -> Path:
             raise RuntimeError("후처리용 임시 저장에 실패했습니다.")
         try:
             patches = compute_left_patches(tmp2, rules, failed_idx)
-            report_widths(tmp2, table_target, frame_target)
+            report_widths(tmp2, table_target, frame_target,
+                          table_fit=tw["mode"] == "doc_width",
+                          frame_fit=fw["mode"] == "doc_width",
+                          frame_skip=rules["frame"]["skip"],
+                          skip_idx=failed_idx)
             hwp.HAction.Run("FileNew")      # 임시 파일 잠금 해제
             if patches:
                 patch_left_colors(tmp2, patches)
@@ -1041,9 +1138,10 @@ def run_cli(paths, visible: bool) -> None:
         traceback.print_exc()
     finally:
         # 더블클릭/드래그앤드롭 실행 시 창이 바로 닫혀 결과를 못 보는 것 방지
+        # (pythonw처럼 콘솔이 없는 환경에서는 input()이 RuntimeError를 냄)
         try:
             input("\n엔터 키를 누르면 창이 닫힙니다...")
-        except EOFError:
+        except (EOFError, RuntimeError):
             pass
 
 
@@ -1064,7 +1162,8 @@ def main():
         run_gui()
         return
     except Exception:
-        pass
+        print("[실행 창을 띄우지 못했습니다 — 파일 선택 창으로 대신합니다]")
+        traceback.print_exc()
     picked = pick_files()
     if not picked:
         print("파일이 선택되지 않았습니다.")
