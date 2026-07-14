@@ -858,6 +858,7 @@ def process(src: Path, visible: bool = False) -> Path:
             f"한글을 실행하지 못했습니다: {last_err}\n"
             "  한글(한컴오피스) 설치 여부와, 작업 관리자에 남아 있는 "
             "한글 프로세스가 없는지 확인해 주세요.")
+    tmp2 = None                         # 후처리 임시 파일 (종료 후 정리용)
     try:
         try:
             hwp.hwp.SetMessageBoxMode(0x00010000)   # 대화상자 자동 처리
@@ -957,43 +958,53 @@ def process(src: Path, visible: bool = False) -> Path:
         tmp2 = make_temp_path(src.parent, "_표정리_후처리")
         if not hwp.save_as(str(tmp2), format="HWPX"):
             raise RuntimeError("후처리용 임시 저장에 실패했습니다.")
-        try:
-            patches = compute_left_patches(tmp2, rules, failed_idx)
-            report_widths(tmp2, table_target, frame_target,
-                          table_fit=tw["mode"] == "doc_width",
-                          frame_fit=fw["mode"] == "doc_width",
-                          frame_skip=rules["frame"]["skip"],
-                          skip_idx=failed_idx)
-            hwp.HAction.Run("FileNew")      # 임시 파일 잠금 해제
-            if patches:
-                patch_left_colors(tmp2, patches)
-                print(f"  왼쪽 테두리 색 보정 {len(patches)}건")
-            if rules["remove_x_styles"]:
-                removed = remove_x_styles_in_hwpx(tmp2)
-                if removed:
-                    print(f"  엑셀 잔재 스타일 제거: {', '.join(removed)}")
-            if not hwp.open(str(tmp2)):
-                raise RuntimeError("후처리 파일을 다시 열지 못했습니다.")
-            if os.path.exists(out):
-                os.remove(out)
-            if not hwp.save_as(str(out), format=fmt):
-                raise RuntimeError("저장에 실패했습니다.")
-        finally:
-            try:
-                hwp.HAction.Run("FileNew")   # tmp2 잠금 해제 후 삭제
-                tmp2.unlink()
-            except Exception:
-                pass
+        patches = compute_left_patches(tmp2, rules, failed_idx)
+        report_widths(tmp2, table_target, frame_target,
+                      table_fit=tw["mode"] == "doc_width",
+                      frame_fit=fw["mode"] == "doc_width",
+                      frame_skip=rules["frame"]["skip"],
+                      skip_idx=failed_idx)
+        hwp.HAction.Run("FileNew")      # 임시 파일 잠금 해제(빈 문서로 전환)
+        if patches:
+            patch_left_colors(tmp2, patches)
+            print(f"  왼쪽 테두리 색 보정 {len(patches)}건")
+        if rules["remove_x_styles"]:
+            removed = remove_x_styles_in_hwpx(tmp2)
+            if removed:
+                print(f"  엑셀 잔재 스타일 제거: {', '.join(removed)}")
+        if not hwp.open(str(tmp2)):
+            raise RuntimeError("후처리 파일을 다시 열지 못했습니다.")
+        if os.path.exists(out):
+            os.remove(out)
+        if not hwp.save_as(str(out), format=fmt):
+            raise RuntimeError("저장에 실패했습니다.")
+        # tmp2 삭제는 한글 종료 후(잠금 해제 확실)의 finally에서 수행한다.
         print(f"\n완료: 표 {done}개 / 그림틀 {frames}개 / 너비조절 {resized}개 / 사진 {photos}개 / 실패 {failed}개")
         print(f"저장 위치: {out}")
         return out
     finally:
-        # 종료 실패(한글 프로세스가 이미 죽은 경우 등)가 원래 오류를
-        # 가리지 않도록 보호한다.
+        # 한글 종료. quit()은 내부에서 빈 문서 정리(clear)를 먼저 하는데
+        # 이 단계가 COM 오류로 실패하는 경우가 있어, 실패하면 clear를
+        # 건너뛰고 곧장 Quit을 호출해 한글 앱을 확실히 닫는다.
+        # (여기서 앱이 닫혀야 FileNew로 생긴 빈 문서 창이 남지 않는다)
         try:
             hwp.quit()
         except Exception:
-            print("※ 한글 종료 중 오류(무시) — 남은 한글 프로세스는 작업 관리자에서 종료하세요")
+            try:
+                hwp.hwp.Quit()
+            except Exception:
+                print("※ 한글 종료 실패 — 남은 한글 프로세스는 작업 관리자에서 종료하세요")
+        # 임시 파일은 한글이 파일 잠금을 완전히 풀어야 지워지므로
+        # 종료 후에 재시도하며 정리한다.
+        if tmp2 is not None and tmp2.exists():
+            for _ in range(10):
+                try:
+                    tmp2.unlink()
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            else:
+                print(f"※ 임시 파일이 남았습니다(다음 실행 때 자동 정리 시도): {tmp2.name}")
 
 
 def run_cli(paths, visible: bool) -> None:
@@ -1048,3 +1059,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # 확실한 프로세스 종료. 한글 COM 서버가 응답 불능이 된 경우
+    # 파이썬 종료 단계(COM 해제)에서 멈춰 프로세스가 살아남을 수 있고,
+    # 그러면 작업창이 완료를 감지하지 못한 채 계속 돌게 된다.
+    # 필요한 출력은 이미 끝났으므로 버퍼만 비우고 즉시 종료한다.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
