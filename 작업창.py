@@ -14,14 +14,17 @@
 """
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import yaml
+
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -82,6 +85,7 @@ class RuleEditor(tk.Toplevel):
         self._build_table_tab(notebook)
         self._build_frame_tab(notebook)
         self._build_object_tab(notebook)
+        self._build_text_style_tab(notebook)
         self._build_raw_tab(notebook)
 
         buttons = ttk.Frame(root)
@@ -101,7 +105,7 @@ class RuleEditor(tk.Toplevel):
                         "문서폭, 유지, 150mm 같은 값을 직접 입력할 수도 있습니다.")
         self._combo_row(tab, "안쪽선 종류", ("표서식", "안쪽선", "종류"), (표.get("안쪽선") or {}).get("종류", "실선"), LINE_TYPES, 1)
         self._combo_row(tab, "안쪽선 굵기", ("표서식", "안쪽선", "굵기"), (표.get("안쪽선") or {}).get("굵기", "0.12mm"), LINE_WIDTHS, 2)
-        self._entry_row(tab, "안쪽선 색", ("표서식", "안쪽선", "색"), (표.get("안쪽선") or {}).get("색", "#000000"), 3)
+        self._color_row(tab, "안쪽선 색", ("표서식", "안쪽선", "색"), (표.get("안쪽선") or {}).get("색", "#000000"), 3)
 
         border_box = ttk.LabelFrame(tab, text="바깥선")
         border_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 6))
@@ -111,11 +115,11 @@ class RuleEditor(tk.Toplevel):
             ttk.Label(border_box, text=label).grid(row=idx, column=0, sticky="w", padx=8, pady=4)
             self._combo(border_box, ("표서식", "바깥선", key, "종류"), rule.get("종류", "실선"), LINE_TYPES, idx, 1)
             self._combo(border_box, ("표서식", "바깥선", key, "굵기"), rule.get("굵기", "0.4mm"), LINE_WIDTHS, idx, 2)
-            self._entry(border_box, ("표서식", "바깥선", key, "색"), rule.get("색", "#000000"), idx, 3, width=10)
+            self._color(border_box, ("표서식", "바깥선", key, "색"), rule.get("색", "#000000"), idx, 3)
 
         self._combo_row(tab, "머리글 사용", ("표서식", "머리글행", "사용"), "켬" if 머리글.get("사용", True) else "끔", ON_OFF, 5)
         self._entry_row(tab, "머리글 행수", ("표서식", "머리글행", "행수"), str(머리글.get("행수", 1)), 6)
-        self._entry_row(tab, "머리글 배경색", ("표서식", "머리글행", "배경색"), 머리글.get("배경색", "#CCCCCC"), 7)
+        self._color_row(tab, "머리글 배경색", ("표서식", "머리글행", "배경색"), 머리글.get("배경색", "#CCCCCC"), 7)
         self._combo_row(tab, "본문 배경", ("표서식", "본문셀", "배경"), 본문.get("배경", "지우기"), CLEAR_KEEP, 8)
         tab.columnconfigure(1, weight=1)
 
@@ -129,7 +133,7 @@ class RuleEditor(tk.Toplevel):
         self._combo_row(tab, "처리", ("그림틀", "처리"), 틀.get("처리", "정리"), ["정리", "건너뛰기"], 1)
         self._combo_row(tab, "테두리 종류", ("그림틀", "테두리", "종류"), 테두리.get("종류", "실선"), LINE_TYPES, 2)
         self._combo_row(tab, "테두리 굵기", ("그림틀", "테두리", "굵기"), 테두리.get("굵기", "0.1mm"), LINE_WIDTHS, 3)
-        self._entry_row(tab, "테두리 색", ("그림틀", "테두리", "색"), 테두리.get("색", "#B3B3B3"), 4)
+        self._color_row(tab, "테두리 색", ("그림틀", "테두리", "색"), 테두리.get("색", "#B3B3B3"), 4)
         self._combo_row(tab, "배경", ("그림틀", "배경"), 틀.get("배경", "지우기"), CLEAR_KEEP, 5)
         self._combo_row(tab, "번호종류", ("그림틀", "번호종류"), 틀.get("번호종류", "그림"), NUMBERING_VALUES, 6)
         tab.columnconfigure(1, weight=1)
@@ -139,13 +143,27 @@ class RuleEditor(tk.Toplevel):
         notebook.add(tab, text="사진/공통")
         사진 = self.rules.setdefault("사진", {})
         개체 = self.rules.setdefault("개체위치", {})
-        스타일 = self.rules.setdefault("스타일정리", {})
 
         self._combo_row(tab, "사진 번호종류", ("사진", "번호종류"), 사진.get("번호종류", "없음"), NUMBERING_VALUES, 0)
         self._combo_row(tab, "사진 너비", ("사진", "너비"), 사진.get("너비", "유지"), WIDTH_VALUES, 1,
                         "사진 너비를 바꾸면 높이는 비율 유지로 자동 조절됩니다.")
         self._combo_row(tab, "글자처럼 취급", ("개체위치", "글자처럼취급"), 개체.get("글자처럼취급", "켬"), ON_OFF_KEEP, 2)
-        self._combo_row(tab, "x스타일 제거", ("스타일정리", "x스타일제거"), 스타일.get("x스타일제거", "켬"), ON_OFF, 3)
+        tab.columnconfigure(1, weight=1)
+
+    def _build_text_style_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=12)
+        notebook.add(tab, text="글자스타일")
+        스타일 = self.rules.setdefault("스타일정리", {})
+
+        self._combo_row(tab, "x스타일 제거", ("스타일정리", "x스타일제거"), 스타일.get("x스타일제거", "켬"), ON_OFF, 0)
+        ttk.Label(
+            tab,
+            text=("엑셀 표를 붙여넣으면 이름이 'x'로 시작하는 잔재 스타일이 남습니다.\n"
+                  "‘켬’으로 두면 이런 스타일을 목록에서 제거합니다. 해당 문단은\n"
+                  "‘바탕글’로 연결되며 글자 모양(글꼴·크기 등)은 그대로 유지됩니다."),
+            foreground="#555555",
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
         tab.columnconfigure(1, weight=1)
 
     def _build_raw_tab(self, notebook):
@@ -174,6 +192,40 @@ class RuleEditor(tk.Toplevel):
     def _entry_row(self, parent, label, path, value, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
         self._entry(parent, path, value, row, 1)
+
+    def _color_row(self, parent, label, path, value, row):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
+        self._color(parent, path, value, row, 1)
+
+    @staticmethod
+    def _safe_color(value):
+        """미리보기에 쓸 수 있는 색만 통과시키고, 아니면 흰색."""
+        v = str(value).strip()
+        return v if HEX_RE.match(v) else "#FFFFFF"
+
+    def _color(self, parent, path, value, row, col, width=9):
+        """색 입력칸 + 실제 색 미리보기 + [색 선택] 버튼."""
+        var = tk.StringVar(value=str(value))
+        self.vars[path] = var
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=col, sticky="w", padx=(8, 0), pady=4)
+        entry = ttk.Entry(box, textvariable=var, width=width)
+        entry.pack(side="left")
+        swatch = tk.Label(box, width=3, relief="sunken",
+                          bg=self._safe_color(var.get()))
+        swatch.pack(side="left", padx=(6, 0), fill="y")
+
+        def refresh(*_):
+            swatch.configure(bg=self._safe_color(var.get()))
+        var.trace_add("write", refresh)
+
+        def pick():
+            _, hexval = colorchooser.askcolor(
+                color=self._safe_color(var.get()), parent=self, title="색 선택")
+            if hexval:
+                var.set(hexval.upper())
+        ttk.Button(box, text="색 선택", width=8, command=pick).pack(side="left", padx=(6, 0))
+        return box
 
     def _combo(self, parent, path, value, values, row, col):
         var = tk.StringVar(value=str(value))
@@ -260,14 +312,21 @@ class WorkWindow(tk.Tk):
 
         action_row = ttk.Frame(root)
         action_row.pack(fill="x", pady=12)
-        self.start_button = ttk.Button(action_row, text="정리 시작", command=self.start)
-        self.start_button.pack(side="left")
+        # 왼쪽: 보조 버튼들
         self.settings_button = ttk.Button(action_row, text="서식 설정", command=self.open_settings)
-        self.settings_button.pack(side="left", padx=(8, 0))
+        self.settings_button.pack(side="left")
         self.folder_button = ttk.Button(action_row, text="결과 폴더 열기", command=self.open_output_folder, state="disabled")
         self.folder_button.pack(side="left", padx=(8, 0))
         self.clear_button = ttk.Button(action_row, text="로그 지우기", command=self.clear_log)
         self.clear_button.pack(side="left", padx=(8, 0))
+        # 오른쪽: 주 실행 버튼(초록색 강조). ttk는 배경색 지정이 어려워 tk.Button 사용.
+        self.start_button = tk.Button(
+            action_row, text="▶ 정리 시작", command=self.start,
+            bg="#2e7d32", fg="white", activebackground="#1b5e20", activeforeground="white",
+            disabledforeground="#dddddd", font=("맑은 고딕", 11, "bold"),
+            relief="raised", bd=2, padx=18, pady=5, cursor="hand2",
+        )
+        self.start_button.pack(side="right")
 
         ttk.Label(root, textvariable=self.status).pack(anchor="w")
 

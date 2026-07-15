@@ -36,6 +36,7 @@
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -837,6 +838,7 @@ def process(src: Path, visible: bool = False) -> Path:
     out = src.with_name(src.stem + "_정리본" + src.suffix)
     fmt = "HWPX" if src.suffix.lower() == ".hwpx" else "HWP"
 
+    print("※ 처리 중 한글 팝업창이 나오면 모두 [확인]을 눌러주세요.", flush=True)
     print("한글 실행 중..." + (" (창 표시 모드)" if visible else ""), flush=True)
     # new=True: 사용자가 직접 열어 둔 한글 창이나 이전 실행의 잔재 인스턴스에
     # 붙지 않도록 항상 독립된 새 인스턴스를 만든다. (기본값 new=False는 기존
@@ -861,7 +863,9 @@ def process(src: Path, visible: bool = False) -> Path:
     tmp2 = None                         # 후처리 임시 파일 (종료 후 정리용)
     try:
         try:
-            hwp.hwp.SetMessageBoxMode(0x00010000)   # 대화상자 자동 처리
+            # 0x2FFF1 = 각종 대화상자에 자동으로 기본(확인/예)으로 응답
+            # (0x00010000 은 일부만 처리해 팝업에서 멈추는 원인이었음)
+            hwp.hwp.SetMessageBoxMode(0x2FFF1)
         except Exception:
             pass
         print(f"문서 여는 중: {src.name}", flush=True)
@@ -984,16 +988,24 @@ def process(src: Path, visible: bool = False) -> Path:
         return out
     finally:
         # 한글 종료. quit()은 내부에서 빈 문서 정리(clear)를 먼저 하는데
-        # 이 단계가 COM 오류로 실패하는 경우가 있어, 실패하면 clear를
-        # 건너뛰고 곧장 Quit을 호출해 한글 앱을 확실히 닫는다.
-        # (여기서 앱이 닫혀야 FileNew로 생긴 빈 문서 창이 남지 않는다)
-        try:
-            hwp.quit()
-        except Exception:
+        # 이 단계가 COM 오류로 실패하면 곧장 Quit을 호출해 앱을 닫는다.
+        # 팝업 등으로 종료가 멈출 수 있으므로 별도 스레드에서 시도하고,
+        # 제한 시간 안에 끝나지 않아도 다음 단계로 넘어간다. (본체의
+        # os._exit가 프로세스를 확실히 끝내 작업창이 완료를 감지하게 함)
+        def _do_quit():
             try:
-                hwp.hwp.Quit()
+                hwp.quit()
             except Exception:
-                print("※ 한글 종료 실패 — 남은 한글 프로세스는 작업 관리자에서 종료하세요")
+                try:
+                    hwp.hwp.Quit()
+                except Exception:
+                    pass
+        t = threading.Thread(target=_do_quit, daemon=True)
+        t.start()
+        t.join(timeout=10)
+        if t.is_alive():
+            print("※ 한글 종료가 지연됩니다 — 팝업이 떠 있으면 [확인]을 누르거나\n"
+                  "  남은 한글 창을 직접 닫아 주세요(작업은 이미 저장됨).")
         # 임시 파일은 한글이 파일 잠금을 완전히 풀어야 지워지므로
         # 종료 후에 재시도하며 정리한다.
         if tmp2 is not None and tmp2.exists():
