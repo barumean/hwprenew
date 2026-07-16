@@ -4,8 +4,7 @@
 
 사용법
   1) 더블클릭 실행 → 작업창(GUI)이 열립니다.
-     (작업창.py 가 같은 폴더에 있으면 그 통합 UI로 연결됩니다.
-      없으면 파일 선택 창으로 대신 동작합니다.)
+     파일을 선택하고 [서식 설정]을 확인한 뒤 [정리 시작]을 누릅니다.
   2) python 표정리.py 문서1.hwp 문서2.hwpx 폴더 ...
      → 나열한 파일과 폴더(바로 아래의 .hwp/.hwpx)를 일괄 처리합니다.
        탐색기에서 파일들을 표정리.py 아이콘 위로 끌어다 놓아도 됩니다.
@@ -13,8 +12,8 @@
      → 한글 창을 띄운 채 실행합니다. 처리가 멈출 때 어떤 대화상자
        (보안 승인, 암호 입력, 문서 복구 등)가 떠 있는지 확인하는 진단용.
 
-  ─ 이 파일(표정리.py)은 실제 처리를 담당하는 엔진 겸 명령줄 도구이며,
-    버튼 중심의 통합 작업창은 작업창.py 입니다. (python 작업창.py)
+  ─ 작업창(GUI)과 처리 엔진(명령줄)이 이 한 파일에 모두 들어 있습니다.
+    작업창은 실제 처리를 이 파일의 하위 프로세스로 실행합니다.
 
 동작
   - 원본 문서는 절대 수정하지 않습니다.
@@ -49,6 +48,15 @@ except Exception:
     pass
 
 import yaml
+
+# tkinter는 GUI(작업창)에서만 쓴다. 처리 엔진/명령줄 실행에는 필요 없으므로
+# 없는 환경(서버 등)에서도 엔진이 동작하도록 가져오기 실패를 허용한다.
+try:
+    import tkinter as tk
+    from tkinter import colorchooser, filedialog, messagebox, ttk
+    _TK_OK = True
+except Exception:
+    _TK_OK = False
 
 # ------------------------------------------------------------------
 # 규칙(설정) 읽기
@@ -757,20 +765,6 @@ def format_table(hwp, ctrl, spec: TableSpec, rules) -> int:
 # 실행
 # ------------------------------------------------------------------
 
-def pick_files() -> list:
-    """파일 선택 대화상자(다중 선택). 선택한 Path 목록을 반환."""
-    import tkinter as tk
-    from tkinter import filedialog
-    root = tk.Tk()
-    root.withdraw()
-    paths = filedialog.askopenfilenames(
-        title="표 서식을 정리할 한글 문서를 선택하세요",
-        filetypes=[("한글 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")],
-    )
-    root.destroy()
-    return [Path(p) for p in paths]
-
-
 def collect_targets(paths) -> list:
     """파일/폴더가 섞인 목록을 실제 처리 대상 문서 목록으로 확장한다.
 
@@ -815,19 +809,6 @@ def run_batch(files, visible: bool = False) -> tuple:
     if many:
         print(f"\n배치 완료: 성공 {ok}개 / 실패 {fail}개")
     return ok, fail
-
-
-def launch_workwindow() -> bool:
-    """통합 작업창(작업창.py)을 별도 프로세스로 띄운다. 성공 시 True.
-
-    작업창.py 가 표정리.py를 하위 프로세스로 호출하므로, 여기서는
-    작업창을 실행만 하고 이 프로세스는 곧바로 반환한다."""
-    import subprocess
-    work = Path(__file__).parent / "작업창.py"
-    if not work.exists():
-        return False
-    subprocess.Popen([sys.executable, str(work)], cwd=str(work.parent))
-    return True
 
 
 def process(src: Path, visible: bool = False) -> Path:
@@ -1034,13 +1015,515 @@ def run_cli(paths, visible: bool) -> None:
         traceback.print_exc()
     finally:
         # 더블클릭/드래그앤드롭 실행 시 창이 바로 닫혀 결과를 못 보는 것 방지.
-        # 단, 작업창.py 등이 하위 프로세스로 호출(출력이 파이프로 연결)한
-        # 경우에는 멈추지 않는다. (콘솔 없는 환경의 RuntimeError도 무시)
+        # 단, 작업창이 하위 프로세스로 호출(출력이 파이프로 연결)한 경우에는
+        # 멈추지 않는다. (콘솔 없는 환경의 RuntimeError도 무시)
         if sys.stdout.isatty():
             try:
                 input("\n엔터 키를 누르면 창이 닫힙니다...")
             except (EOFError, RuntimeError):
                 pass
+
+
+# ------------------------------------------------------------------
+# 작업창(GUI) — 파일 선택·서식 설정·진행 로그를 제공하고, 실제 처리는
+#   이 파일(표정리.py)을 하위 프로세스로 호출해 수행한다(한글 COM 격리).
+#   tkinter가 없는 환경에서는 이 아래 클래스들이 정의되지 않는다.
+# ------------------------------------------------------------------
+
+# 표준 서식 프리셋 기본값 — 서식규칙.yaml 이 없거나 일부 항목이 비어도
+# 작업창의 [서식 설정]에 이 값들이 기본으로 채워진다(서식 샘플 기준).
+DEFAULT_RULES = {
+    "표서식": {
+        "너비": "문서폭",
+        "바깥선": {
+            "위":     {"종류": "실선", "굵기": "0.4mm", "색": "#000000"},
+            "아래":   {"종류": "실선", "굵기": "0.4mm", "색": "#000000"},
+            "왼쪽":   {"종류": "없음"},
+            "오른쪽": {"종류": "없음"},
+        },
+        "안쪽선": {"종류": "실선", "굵기": "0.12mm", "색": "#000000"},
+        "머리글행": {"사용": True, "행수": 1, "배경색": "#CCCCCC",
+                    "아래선": {"종류": "이중실선", "굵기": "0.5mm", "색": "#000000"}},
+        "본문셀": {"배경": "지우기"},
+    },
+    "그림틀": {
+        "너비": "문서폭", "처리": "정리",
+        "테두리": {"종류": "실선", "굵기": "0.1mm", "색": "#B3B3B3"},
+        "배경": "지우기", "번호종류": "그림",
+    },
+    "사진": {"번호종류": "없음", "너비": "유지"},
+    "개체위치": {"글자처럼취급": "켬"},
+    "스타일정리": {"x스타일제거": "켬"},
+}
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    """base(기본값) 위에 over(사용자 값)를 재귀적으로 덮어쓴 새 dict를 만든다."""
+    import copy
+    result = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = copy.deepcopy(v)
+    return result
+
+
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+if _TK_OK:
+    # 콤보박스 선택지 — 엔진의 정의(dict)를 단일 출처로 재사용(순서 유지)
+    _GUI_LINE_TYPES = list(LINE_TYPES)
+    _GUI_LINE_WIDTHS = list(LINE_WIDTHS)
+    _GUI_NUMBERING = list(NUMBERING_TYPES)
+    _WIDTH_VALUES = ["유지", "문서폭", "120mm", "150mm", "180mm"]
+    _ON_OFF_KEEP = ["켬", "끔", "유지"]
+    _ON_OFF = ["켬", "끔"]
+    _CLEAR_KEEP = ["지우기", "유지"]
+
+    class RuleEditor(tk.Toplevel):
+        """서식규칙.yaml의 자주 쓰는 항목을 폼으로 편집하는 설정 창."""
+
+        def __init__(self, master, config_path: Path, on_saved):
+            super().__init__(master)
+            self.config_path = config_path
+            self.title("서식 설정")
+            self.geometry("760x660")
+            self.minsize(680, 580)
+            self.transient(master)
+            self.grab_set()
+
+            self.on_saved = on_saved
+            self.rules = self._load_rules()
+            self.vars = {}
+            self._line_bases = []           # 종류/굵기/색 한 벌짜리 선 항목들의 기준 경로
+            self._build_ui()
+
+        def _load_rules(self):
+            """기본값(DEFAULT_RULES) 위에 저장된 yaml을 덮어써, 모든 항목이
+            표준값으로 채워진 규칙을 만든다."""
+            user = {}
+            if self.config_path.exists():
+                with open(self.config_path, encoding="utf-8") as f:
+                    user = yaml.safe_load(f) or {}
+            return _deep_merge(DEFAULT_RULES, user)
+
+        def _build_ui(self):
+            root = ttk.Frame(self, padding=14)
+            root.pack(fill="both", expand=True)
+            ttk.Label(root, text="서식 설정", font=("맑은 고딕", 15, "bold")).pack(anchor="w")
+            ttk.Label(root, text="표준 서식이 기본으로 채워져 있습니다. 바꿀 항목만 수정한 뒤 저장하세요.",
+                      foreground="#555555").pack(anchor="w", pady=(2, 10))
+
+            notebook = ttk.Notebook(root)
+            notebook.pack(fill="both", expand=True)
+            self._build_table_tab(notebook)
+            self._build_frame_tab(notebook)
+            self._build_object_tab(notebook)
+            self._build_text_style_tab(notebook)
+            self._build_raw_tab(notebook)
+
+            buttons = ttk.Frame(root)
+            buttons.pack(fill="x", pady=(12, 0))
+            ttk.Button(buttons, text="저장", command=self.save).pack(side="right")
+            ttk.Button(buttons, text="취소", command=self.destroy).pack(side="right", padx=(0, 8))
+
+        # ── 탭 구성 ──
+        def _build_table_tab(self, notebook):
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="표 서식")
+            표 = self.rules["표서식"]
+            바깥 = 표["바깥선"]
+            머리글 = 표["머리글행"]
+
+            self._combo_row(tab, "표 너비", ("표서식", "너비"), 표["너비"], _WIDTH_VALUES, 0,
+                            "문서폭 / 유지 / 150mm 처럼 직접 입력도 가능")
+            # 안쪽선(종류/굵기/색) — 종류가 '없음'이면 굵기·색 비활성화
+            self._line_rows(tab, "안쪽선", ("표서식", "안쪽선"), 표["안쪽선"], start_row=1)
+
+            border_box = ttk.LabelFrame(tab, text="바깥선 (종류가 ‘없음’이면 굵기·색은 비활성)")
+            border_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+            for idx, key in enumerate(("위", "아래", "왼쪽", "오른쪽")):
+                rule = 바깥.get(key) or {}
+                ttk.Label(border_box, text=key).grid(row=idx, column=0, sticky="w", padx=8, pady=4)
+                self._line_cells(border_box, ("표서식", "바깥선", key), rule, idx)
+
+            self._combo_row(tab, "머리글 사용", ("표서식", "머리글행", "사용"),
+                            "켬" if 머리글.get("사용", True) else "끔", _ON_OFF, 5)
+            self._entry_row(tab, "머리글 행수", ("표서식", "머리글행", "행수"), str(머리글.get("행수", 1)), 6)
+            self._color_row(tab, "머리글 배경색", ("표서식", "머리글행", "배경색"), 머리글.get("배경색", "#CCCCCC"), 7)
+            self._combo_row(tab, "본문 배경", ("표서식", "본문셀", "배경"), 표["본문셀"].get("배경", "지우기"), _CLEAR_KEEP, 8)
+            tab.columnconfigure(1, weight=1)
+
+        def _build_frame_tab(self, notebook):
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="그림틀")
+            틀 = self.rules["그림틀"]
+            self._combo_row(tab, "그림틀 너비", ("그림틀", "너비"), 틀["너비"], _WIDTH_VALUES, 0)
+            self._combo_row(tab, "처리", ("그림틀", "처리"), 틀["처리"], ["정리", "건너뛰기"], 1)
+            self._line_rows(tab, "테두리", ("그림틀", "테두리"), 틀["테두리"], start_row=2)
+            self._combo_row(tab, "배경", ("그림틀", "배경"), 틀["배경"], _CLEAR_KEEP, 5)
+            self._combo_row(tab, "번호종류", ("그림틀", "번호종류"), 틀["번호종류"], _GUI_NUMBERING, 6)
+            tab.columnconfigure(1, weight=1)
+
+        def _build_object_tab(self, notebook):
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="사진/공통")
+            사진, 개체 = self.rules["사진"], self.rules["개체위치"]
+            self._combo_row(tab, "사진 번호종류", ("사진", "번호종류"), 사진["번호종류"], _GUI_NUMBERING, 0)
+            self._combo_row(tab, "사진 너비", ("사진", "너비"), 사진["너비"], _WIDTH_VALUES, 1,
+                            "너비를 바꾸면 높이는 비율 유지로 자동 조절")
+            self._combo_row(tab, "글자처럼 취급", ("개체위치", "글자처럼취급"), 개체["글자처럼취급"], _ON_OFF_KEEP, 2)
+            tab.columnconfigure(1, weight=1)
+
+        def _build_text_style_tab(self, notebook):
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="글자스타일")
+            self._combo_row(tab, "x스타일 제거", ("스타일정리", "x스타일제거"),
+                            self.rules["스타일정리"]["x스타일제거"], _ON_OFF, 0)
+            ttk.Label(tab, text=("엑셀 표를 붙여넣으면 이름이 'x'로 시작하는 잔재 스타일이 남습니다.\n"
+                                 "‘켬’으로 두면 이런 스타일을 목록에서 제거합니다. 해당 문단은\n"
+                                 "‘바탕글’로 연결되며 글자 모양(글꼴·크기 등)은 그대로 유지됩니다."),
+                      foreground="#555555", justify="left").grid(
+                          row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+            tab.columnconfigure(1, weight=1)
+
+        def _build_raw_tab(self, notebook):
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="원본 YAML")
+            ttk.Label(tab, text="고급 사용자는 아래 내용을 직접 수정할 수 있습니다.",
+                      foreground="#555555").pack(anchor="w")
+            frame = ttk.Frame(tab)
+            frame.pack(fill="both", expand=True, pady=(8, 0))
+            self.raw_text = tk.Text(frame, wrap="none")
+            sy = ttk.Scrollbar(frame, orient="vertical", command=self.raw_text.yview)
+            sx = ttk.Scrollbar(frame, orient="horizontal", command=self.raw_text.xview)
+            self.raw_text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+            self.raw_text.grid(row=0, column=0, sticky="nsew")
+            sy.grid(row=0, column=1, sticky="ns")
+            sx.grid(row=1, column=0, sticky="ew")
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            self.raw_text.insert("1.0", yaml.safe_dump(self.rules, allow_unicode=True, sort_keys=False))
+
+        # ── 선 항목(종류/굵기/색) 한 벌 + 없음일 때 비활성화 ──
+        def _line_rows(self, parent, label, base, rule, start_row):
+            """세로 3줄 배치(표 서식 탭용)."""
+            tvar = self._combo_row(parent, f"{label} 종류", base + ("종류",), rule.get("종류", "실선"),
+                                   _GUI_LINE_TYPES, start_row)
+            wcombo = self._combo_row(parent, f"{label} 굵기", base + ("굵기",), rule.get("굵기", "0.12mm"),
+                                     _GUI_LINE_WIDTHS, start_row + 1)
+            chandle = self._color_row(parent, f"{label} 색", base + ("색",), rule.get("색", "#000000"),
+                                      start_row + 2)
+            self._wire_line(base, self.vars[base + ("종류",)], wcombo, chandle)
+
+        def _line_cells(self, parent, base, rule, row):
+            """가로 한 줄 배치(바깥선 박스용)."""
+            tvar_combo = self._combo(parent, base + ("종류",), rule.get("종류", "실선"), _GUI_LINE_TYPES, row, 1)
+            wcombo = self._combo(parent, base + ("굵기",), rule.get("굵기", "0.4mm"), _GUI_LINE_WIDTHS, row, 2)
+            chandle = self._color(parent, base + ("색",), rule.get("색", "#000000"), row, 3)
+            self._wire_line(base, self.vars[base + ("종류",)], wcombo, chandle)
+
+        def _wire_line(self, base, type_var, width_combo, color_handle):
+            """종류가 '없음'이면 굵기 콤보와 색 위젯을 비활성화한다."""
+            self._line_bases.append(base)
+            deps = [width_combo, color_handle["entry"], color_handle["button"]]
+            swatch = color_handle["swatch"]
+
+            def apply(*_):
+                off = str(type_var.get()).strip() == "없음"
+                for w in deps:
+                    try:
+                        w.configure(state="disabled" if off else "normal")
+                    except tk.TclError:
+                        pass
+                swatch.configure(bg="#EEEEEE" if off else self._safe_color(color_handle["var"].get()))
+            type_var.trace_add("write", apply)
+            apply()
+
+        # ── 위젯 헬퍼 ──
+        def _combo_row(self, parent, label, path, value, values, row, help_text=None):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            combo = self._combo(parent, path, value, values, row, 1)
+            if help_text:
+                ttk.Label(parent, text=help_text, foreground="#666666").grid(
+                    row=row, column=2, sticky="w", padx=(8, 0))
+            return combo
+
+        def _entry_row(self, parent, label, path, value, row):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            return self._entry(parent, path, value, row, 1)
+
+        def _color_row(self, parent, label, path, value, row):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            return self._color(parent, path, value, row, 1)
+
+        @staticmethod
+        def _safe_color(value):
+            v = str(value).strip()
+            return v if HEX_RE.match(v) else "#FFFFFF"
+
+        def _combo(self, parent, path, value, values, row, col):
+            var = tk.StringVar(value=str(value))
+            self.vars[path] = var
+            box = ttk.Combobox(parent, textvariable=var, values=values)
+            box.grid(row=row, column=col, sticky="ew", padx=(8, 0), pady=4)
+            return box
+
+        def _entry(self, parent, path, value, row, col, width=None):
+            var = tk.StringVar(value=str(value))
+            self.vars[path] = var
+            entry = ttk.Entry(parent, textvariable=var, width=width)
+            entry.grid(row=row, column=col, sticky="ew", padx=(8, 0), pady=4)
+            return entry
+
+        def _color(self, parent, path, value, row, col, width=9):
+            """색 입력칸 + 실제 색 미리보기 + [색 선택] 버튼. 핸들(dict) 반환."""
+            var = tk.StringVar(value=str(value))
+            self.vars[path] = var
+            box = ttk.Frame(parent)
+            box.grid(row=row, column=col, sticky="w", padx=(8, 0), pady=4)
+            entry = ttk.Entry(box, textvariable=var, width=width)
+            entry.pack(side="left")
+            swatch = tk.Label(box, width=3, relief="sunken", bg=self._safe_color(var.get()))
+            swatch.pack(side="left", padx=(6, 0), fill="y")
+            var.trace_add("write", lambda *_: swatch.configure(bg=self._safe_color(var.get())))
+
+            def pick():
+                _, hexval = colorchooser.askcolor(color=self._safe_color(var.get()),
+                                                  parent=self, title="색 선택")
+                if hexval:
+                    var.set(hexval.upper())
+            button = ttk.Button(box, text="색 선택", width=8, command=pick)
+            button.pack(side="left", padx=(6, 0))
+            return {"var": var, "entry": entry, "button": button, "swatch": swatch}
+
+        # ── 저장 ──
+        def save(self):
+            try:
+                raw_content = self.raw_text.get("1.0", "end").strip()
+                raw_rules = yaml.safe_load(raw_content) if raw_content else {}
+                if not isinstance(raw_rules, dict):
+                    raise ValueError("YAML 최상위 구조는 객체여야 합니다.")
+                self.rules = raw_rules
+                for path, var in self.vars.items():
+                    self._set_value(path, var.get())
+                self._normalize_types()
+                # 선 종류가 '없음'이면 굵기·색은 의미 없으므로 지워 깔끔하게 저장
+                for base in self._line_bases:
+                    node = self._get_node(base)
+                    if isinstance(node, dict) and str(node.get("종류")) == "없음":
+                        node.pop("굵기", None)
+                        node.pop("색", None)
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(self.rules, f, allow_unicode=True, sort_keys=False)
+            except Exception as exc:
+                messagebox.showerror("설정 저장 실패", str(exc))
+                return
+            self.on_saved()
+            messagebox.showinfo("설정 저장", "서식규칙.yaml에 저장했습니다.")
+            self.destroy()
+
+        def _get_node(self, path):
+            cur = self.rules
+            for key in path:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(key)
+            return cur
+
+        def _set_value(self, path, value):
+            cur = self.rules
+            for key in path[:-1]:
+                cur = cur.setdefault(key, {})
+            cur[path[-1]] = value
+
+        def _normalize_types(self):
+            header = self.rules.setdefault("표서식", {}).setdefault("머리글행", {})
+            header["사용"] = str(header.get("사용", "켬")) == "켬"
+            try:
+                header["행수"] = int(header.get("행수", 1))
+            except (TypeError, ValueError):
+                raise ValueError("머리글 행수는 숫자로 입력해야 합니다.")
+
+    class WorkWindow(tk.Tk):
+        """파일 선택·서식 설정·실행 로그를 제공하는 메인 작업창."""
+
+        def __init__(self, script_path: Path, config_path: Path):
+            super().__init__()
+            self.script_path = script_path
+            self.config_path = config_path
+            self.title("HWP 표 서식 정리 작업창")
+            self.geometry("820x620")
+            self.minsize(720, 540)
+
+            self.selected_file = tk.StringVar(value="")
+            self.status = tk.StringVar(value="정리할 HWP/HWPX 파일을 선택하세요.")
+            self.output_file = None
+            self.worker = None
+            self.log_queue = __import__("queue").Queue()
+            self._build_ui()
+            self.after(100, self._drain_log_queue)
+
+        def _build_ui(self):
+            root = ttk.Frame(self, padding=16)
+            root.pack(fill="both", expand=True)
+            ttk.Label(root, text="HWP 표 서식 일괄정리", font=("맑은 고딕", 16, "bold")).pack(anchor="w")
+            ttk.Label(root, text="파일을 선택하고 [서식 설정]을 확인한 뒤 [정리 시작]을 누르면 *_정리본 파일을 생성합니다.").pack(
+                anchor="w", pady=(4, 14))
+
+            file_row = ttk.Frame(root)
+            file_row.pack(fill="x")
+            ttk.Entry(file_row, textvariable=self.selected_file).pack(side="left", fill="x", expand=True)
+            ttk.Button(file_row, text="파일 선택", command=self.pick_file).pack(side="left", padx=(8, 0))
+
+            action_row = ttk.Frame(root)
+            action_row.pack(fill="x", pady=12)
+            self.settings_button = ttk.Button(action_row, text="서식 설정", command=self.open_settings)
+            self.settings_button.pack(side="left")
+            self.folder_button = ttk.Button(action_row, text="결과 폴더 열기",
+                                            command=self.open_output_folder, state="disabled")
+            self.folder_button.pack(side="left", padx=(8, 0))
+            self.clear_button = ttk.Button(action_row, text="로그 지우기", command=self.clear_log)
+            self.clear_button.pack(side="left", padx=(8, 0))
+            # 오른쪽: 주 실행 버튼(초록색 강조)
+            self.start_button = tk.Button(
+                action_row, text="▶ 정리 시작", command=self.start,
+                bg="#2e7d32", fg="white", activebackground="#1b5e20", activeforeground="white",
+                disabledforeground="#dddddd", font=("맑은 고딕", 11, "bold"),
+                relief="raised", bd=2, padx=18, pady=5, cursor="hand2")
+            self.start_button.pack(side="right")
+
+            ttk.Label(root, textvariable=self.status).pack(anchor="w")
+            self.progress = ttk.Progressbar(root, mode="indeterminate")
+            self.progress.pack(fill="x", pady=(8, 8))
+
+            log_frame = ttk.LabelFrame(root, text="작업 로그")
+            log_frame.pack(fill="both", expand=True)
+            self.log = tk.Text(log_frame, wrap="word", height=18)
+            scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+            self.log.configure(yscrollcommand=scroll.set)
+            self.log.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="right", fill="y")
+
+            ttk.Label(root, foreground="#666666",
+                      text="※ 처리 중 한글 팝업창이 나오면 모두 [확인]을 눌러주세요. "
+                           "멈추면 명령창에서 python 표정리.py --보기 문서.hwp 로 확인할 수 있습니다.").pack(
+                          anchor="w", pady=(8, 0))
+
+        def open_settings(self):
+            RuleEditor(self, self.config_path, on_saved=self._settings_saved)
+
+        def _settings_saved(self):
+            self.status.set("서식 설정을 저장했습니다. 정리 시작을 누르면 새 설정이 적용됩니다.")
+            self._append_log("\n⚙ 서식 설정 저장 완료: 서식규칙.yaml\n")
+
+        def pick_file(self):
+            path = filedialog.askopenfilename(
+                title="표 서식을 정리할 한글 문서를 선택하세요",
+                filetypes=[("한글 문서", "*.hwp *.hwpx"), ("모든 파일", "*.*")])
+            if path:
+                self.selected_file.set(path)
+                self.output_file = self._expected_output(Path(path))
+                self.status.set("파일 선택 완료. 필요하면 서식 설정을 확인한 뒤 정리 시작을 누르세요.")
+                self.folder_button.configure(state="disabled")
+
+        def start(self):
+            src = Path(self.selected_file.get())
+            if not src.exists():
+                messagebox.showwarning("파일 확인", "정리할 HWP/HWPX 파일을 먼저 선택하세요.")
+                return
+            if self.worker and self.worker.is_alive():
+                messagebox.showinfo("진행 중", "이미 작업이 진행 중입니다.")
+                return
+            self.output_file = self._expected_output(src)
+            self.start_button.configure(state="disabled")
+            self.settings_button.configure(state="disabled")
+            self.folder_button.configure(state="disabled")
+            self.progress.start(10)
+            self.status.set("정리 작업 실행 중...")
+            self._append_log(f"\n▶ 시작: {src}\n")
+            self.worker = threading.Thread(target=self._run_process, args=(src,), daemon=True)
+            self.worker.start()
+
+        def _run_process(self, src: Path):
+            import subprocess
+            cmd = [sys.executable, str(self.script_path), str(src)]
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=str(self.script_path.parent),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", env=env)
+                for line in proc.stdout:
+                    self.log_queue.put(("log", line))
+                self.log_queue.put(("done", proc.wait()))
+            except Exception as exc:
+                self.log_queue.put(("error", str(exc)))
+
+        def _drain_log_queue(self):
+            import queue as _q
+            try:
+                while True:
+                    kind, payload = self.log_queue.get_nowait()
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "done":
+                        self._finish(payload)
+                    else:
+                        self._append_log(f"\n[작업창 오류] {payload}\n")
+                        self._finish(1)
+            except _q.Empty:
+                pass
+            self.after(100, self._drain_log_queue)
+
+        def _finish(self, code: int):
+            self.progress.stop()
+            self.start_button.configure(state="normal")
+            self.settings_button.configure(state="normal")
+            if code == 0 and self.output_file and self.output_file.exists():
+                self.status.set(f"완료: {self.output_file.name}")
+                self.folder_button.configure(state="normal")
+                self._append_log(f"\n✅ 완료: {self.output_file}\n")
+            elif code == 0:
+                self.status.set("프로세스는 종료되었지만 결과 파일을 확인하지 못했습니다.")
+                self._append_log("\n⚠ 결과 파일을 확인하지 못했습니다. 로그를 확인하세요.\n")
+            else:
+                self.status.set("작업 실패. 로그를 확인하세요.")
+                self._append_log("\n❌ 작업 실패. 로그를 확인하세요.\n")
+
+        def open_output_folder(self):
+            if not self.output_file:
+                return
+            folder = self.output_file.parent
+            if sys.platform.startswith("win"):
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                __import__("subprocess").Popen(["open", str(folder)])
+            else:
+                __import__("subprocess").Popen(["xdg-open", str(folder)])
+
+        def clear_log(self):
+            self.log.delete("1.0", "end")
+
+        def _append_log(self, text: str):
+            self.log.insert("end", text)
+            self.log.see("end")
+
+        @staticmethod
+        def _expected_output(src: Path) -> Path:
+            return src.with_name(src.stem + "_정리본" + src.suffix)
+
+
+def run_workwindow() -> None:
+    """작업창(GUI)을 띄운다. tkinter가 없으면 명령줄 사용을 안내한다."""
+    if not _TK_OK:
+        print("GUI(작업창)를 사용할 수 없습니다(tkinter 미설치).\n"
+              "  명령줄로 파일을 지정해 실행하세요:  python 표정리.py 문서.hwp")
+        return
+    here = Path(__file__).resolve()
+    WorkWindow(here, here.parent / "서식규칙.yaml").mainloop()
 
 
 def main():
@@ -1053,20 +1536,7 @@ def main():
     if args:                            # 파일/폴더를 나열한 명령줄 모드
         run_cli(args, visible)
         return
-
-    # 인자 없음(더블클릭) → 통합 작업창(작업창.py)을 띄운다.
-    # 작업창.py 가 없거나 실행에 실패하면 파일 선택 대화상자로 대신한다.
-    try:
-        if launch_workwindow():
-            return
-    except Exception:
-        print("[작업창을 띄우지 못했습니다 — 파일 선택 창으로 대신합니다]")
-        traceback.print_exc()
-    picked = pick_files()
-    if not picked:
-        print("파일이 선택되지 않았습니다.")
-        return
-    run_cli(picked, visible)
+    run_workwindow()                    # 인자 없음(더블클릭) → 작업창
 
 
 if __name__ == "__main__":
