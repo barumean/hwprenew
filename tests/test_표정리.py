@@ -259,7 +259,127 @@ check("목표가 없으면 아무것도 출력 안 함", buf.getvalue() == "")
 p4.unlink()
 
 # ══════════════════════════════════════════════════════════════
-print("\n[8] 처리 대상 수집 (파일·폴더)")
+print("\n[8] 편집 불가 문서 대응 (읽기 전용·양식 모드)")
+
+
+class FakeInner:
+    """한글 COM(hwp.hwp) 흉내: 셀 진입 가능 여부를 흉내낸다."""
+
+    def __init__(self, in_cell=False):
+        self.in_cell = in_cell
+        self.CellShape = in_cell
+
+    def FindCtrl(self):
+        return True
+
+    def KeyIndicator(self):
+        return (1, 1, 1, 1, 1, 1, "(A1)" if self.in_cell else "1/1")
+
+
+class FakeHwp:
+    """편집 모드 전환과 표 진입을 흉내내는 최소한의 가짜 한글."""
+
+    def __init__(self, edit_mode=1, can_switch=True, enter_works=True,
+                 enter_needs_fallback=False):
+        self.EditMode = edit_mode
+        self._can_switch = can_switch
+        self._enter_works = enter_works
+        self._needs_fallback = enter_needs_fallback
+        self.hwp = FakeInner()
+        self.opened = []
+        self.actions = []
+
+    # pyhwpx 인터페이스 흉내
+    def open(self, path):
+        self.opened.append(path)
+        return True
+
+    def set_pos_by_set(self, *a):
+        pass
+
+    class _Action:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def Run(self, name):
+            o = self.outer
+            o.actions.append(name)
+            if name == "ShapeObjTableSelCell" and o._enter_works and not o._needs_fallback:
+                o.hwp.in_cell = o.hwp.CellShape = True
+            if name == "ShapeObjTextBoxEdit" and o._enter_works and o._needs_fallback:
+                o.hwp.in_cell = o.hwp.CellShape = True
+
+    @property
+    def HAction(self):
+        return FakeHwp._Action(self)
+
+
+class FakeHwpStrictMode(FakeHwp):
+    """EditMode 대입이 먹지 않는(편집 제한) 문서."""
+
+    def __setattr__(self, k, v):
+        if k == "EditMode" and getattr(self, "_locked", False):
+            return                                              # 대입 무시
+        super().__setattr__(k, v)
+
+
+class FakeCtrl:
+    def GetAnchorPos(self, n):
+        return ("pos",)
+
+
+# 편집 모드 정상 → 아무 일도 안 함
+h = FakeHwp(edit_mode=1)
+m.ensure_edit_mode(h)
+check("편집 모드면 그대로 통과", h.EditMode == 1)
+
+# 읽기 전용 → 편집 모드로 전환
+h = FakeHwp(edit_mode=0)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.ensure_edit_mode(h)
+check("읽기 전용이면 편집 모드로 전환", h.EditMode == 1)
+check("전환 사실을 알림", "편집 모드로 전환" in buf.getvalue())
+
+# 전환이 안 되는 문서 → 명확한 오류
+h = FakeHwpStrictMode(edit_mode=0)
+h._locked = True
+try:
+    m.ensure_edit_mode(h)
+    check("편집 전환 실패 시 오류", False)
+except RuntimeError as e:
+    check("편집 전환 실패 시 원인 안내",
+          "편집 불가" in str(e) and "다른 한글 창" in str(e))
+
+# open_document 는 열기 + 편집 모드 확인을 함께 한다
+h = FakeHwp(edit_mode=0)
+with contextlib.redirect_stdout(io.StringIO()):
+    check("open_document 성공", m.open_document(h, Path("a.hwp")) is True)
+check("open_document 가 편집 모드까지 보장", h.EditMode == 1)
+
+# 표 진입: 1차 방법 성공
+h = FakeHwp()
+m.enter_table(h, FakeCtrl())
+check("표 진입 1차(ShapeObjTableSelCell)", h.actions[:2] == ["ShapeObjTableSelCell", "Cancel"])
+
+# 표 진입: 1차 실패 → 2차(글상자 편집)로 성공
+h = FakeHwp(enter_needs_fallback=True)
+m.enter_table(h, FakeCtrl())
+check("표 진입 2차(ShapeObjTextBoxEdit)로 복구", "ShapeObjTextBoxEdit" in h.actions)
+
+# 표 진입 완전 실패 → '셀 0개'가 아니라 원인을 말한다
+h = FakeHwp(enter_works=False)
+try:
+    m.enter_table(h, FakeCtrl())
+    check("표 진입 실패 시 예외", False)
+except RuntimeError as e:
+    check("표 진입 실패 시 원인·상태 안내",
+          "캐럿을 옮기지 못했습니다" in str(e) and "편집모드=" in str(e) and "위치표시=" in str(e))
+
+check("진단 문자열에 셀 상태 포함", "셀안=" in m.cell_entry_diagnosis(FakeHwp()))
+
+# ══════════════════════════════════════════════════════════════
+print("\n[9] 처리 대상 수집 (파일·폴더)")
 tdir = Path(tempfile.mkdtemp())
 for name in ("a.hwp", "b.HWPX", "c_정리본.hwp", "_표정리_후처리.hwpx", "d.txt"):
     (tdir / name).write_text("")
@@ -272,7 +392,7 @@ check("직접 지정한 정리본은 존중 + 중복 제거",
       == ["c_정리본.hwp", "a.hwp", "b.HWPX"])
 
 # ══════════════════════════════════════════════════════════════
-print("\n[9] 여러 문서 일괄 처리 (run_batch)")
+print("\n[10] 여러 문서 일괄 처리 (run_batch)")
 calls = []
 
 

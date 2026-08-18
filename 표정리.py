@@ -365,7 +365,7 @@ def analyze_tables(hwp, src: Path) -> list:
     finally:
         # save_as 이후에는 임시 파일이 '현재 문서'가 되어 잠겨 있으므로
         # 원본을 다시 열어 잠금을 풀고 임시 파일을 지운다.
-        reopened = hwp.open(str(src))
+        reopened = open_document(hwp, src)
         try:
             tmp.unlink()
         except OSError:
@@ -596,12 +596,67 @@ def collect_tables(hwp):
     return tables
 
 
+def ensure_edit_mode(hwp) -> None:
+    """읽기 전용/양식 모드로 열린 문서를 편집 모드로 되돌린다.
+
+    편집 불가 상태에서는 셀 선택 같은 편집 액션이 조용히 무시되어
+    '셀 0개' 실패가 표마다 반복되므로, 문서를 연 직후에 바로잡는다."""
+    try:
+        if hwp.EditMode == 1:
+            return
+    except Exception:
+        return                          # 이 속성을 못 읽는 버전이면 그냥 진행
+    try:
+        hwp.EditMode = 1
+    except Exception:
+        pass
+    try:
+        if hwp.EditMode == 1:
+            print("  문서가 편집 불가 상태로 열려 편집 모드로 전환했습니다.", flush=True)
+            return
+    except Exception:
+        return
+    raise RuntimeError(
+        "문서가 편집 불가 상태(읽기 전용 또는 양식 모드)입니다.\n"
+        "  이 문서를 다른 한글 창에서 열어 두었다면 닫고 다시 실행해 주세요.\n"
+        "  (배포용 문서나 편집 제한이 걸린 문서는 정리할 수 없습니다)")
+
+
+def open_document(hwp, path) -> bool:
+    """문서를 열고 편집 모드를 확인한다."""
+    if not hwp.open(str(path)):
+        return False
+    ensure_edit_mode(hwp)
+    return True
+
+
+def cell_entry_diagnosis(hwp) -> str:
+    """표 진입 실패 원인 파악용 현재 상태 요약."""
+    bits = []
+    for 이름, fn in (("편집모드", lambda: hwp.EditMode),
+                    ("셀안", lambda: bool(hwp.hwp.CellShape)),
+                    ("위치표시", lambda: hwp.hwp.KeyIndicator())):
+        try:
+            bits.append(f"{이름}={fn()!r}")
+        except Exception as e:
+            bits.append(f"{이름}=?({type(e).__name__})")
+    return ", ".join(bits)
+
+
 def enter_table(hwp, ctrl):
-    """해당 표의 첫 셀에 캐럿을 놓는다(블록 없음)."""
-    hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
-    hwp.hwp.FindCtrl()
-    hwp.HAction.Run("ShapeObjTableSelCell")
-    hwp.HAction.Run("Cancel")
+    """해당 표의 첫 셀에 캐럿을 놓는다(블록 없음).
+
+    표 안으로 들어가지 못하면 예외를 낸다. (예전에는 조용히 실패해
+    '셀 0개만 방문됨' 이라는 엉뚱한 메시지가 나왔다)"""
+    for 방법 in ("ShapeObjTableSelCell", "ShapeObjTextBoxEdit"):
+        hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+        hwp.hwp.FindCtrl()
+        hwp.HAction.Run(방법)
+        if 방법 == "ShapeObjTableSelCell":
+            hwp.HAction.Run("Cancel")   # 셀 블록만 해제(캐럿은 셀 안에 남음)
+        if current_cell_addr(hwp) is not None:
+            return
+    raise RuntimeError(f"표 안으로 캐럿을 옮기지 못했습니다 ({cell_entry_diagnosis(hwp)})")
 
 
 ADDR_RE = re.compile(r"\(([A-Z]+)(\d+)\)")
@@ -941,7 +996,7 @@ def process(src: Path, visible: bool = False) -> Path:
         except Exception:
             pass
         print(f"문서 여는 중: {src.name}", flush=True)
-        if not hwp.open(str(src)):
+        if not open_document(hwp, src):
             raise RuntimeError("문서를 열 수 없습니다. (암호/배포용 문서이거나 다른 프로그램에서 사용 중일 수 있습니다)")
 
         print("문서 열기 완료 — 표 구조 분석 중...", flush=True)
@@ -1001,6 +1056,16 @@ def process(src: Path, visible: bool = False) -> Path:
                 failed_idx.add(i - 1)
                 print(f"  {label} — 실패({e}) → 건너뜀")
 
+        # 표가 있는데 하나도 정리하지 못했다면 문서 전체의 문제다.
+        # 아무것도 바뀌지 않은 '정리본'을 만들어 혼란을 주지 않도록 중단한다.
+        if failed and not done and not frames:
+            raise RuntimeError(
+                f"표 {failed}개를 모두 정리하지 못했습니다 — 문서를 저장하지 않았습니다.\n"
+                f"  현재 상태: {cell_entry_diagnosis(hwp)}\n"
+                "  이 문서가 다른 한글 창에서 열려 있으면 닫고 다시 실행해 주세요.\n"
+                "  계속 같은 증상이면 python 표정리.py --보기 문서.hwp 로 실행해\n"
+                "  한글 화면에서 어떤 상태인지 확인해 주세요.")
+
         # 개체 공통 속성 정리: 사진 번호종류·너비 + 글자처럼 취급(표/그림)
         photos = photos_resized = tac_changed = 0
         tac = rules["treat_as_char"]
@@ -1048,7 +1113,7 @@ def process(src: Path, visible: bool = False) -> Path:
             removed = remove_x_styles_in_hwpx(tmp2)
             if removed:
                 print(f"  엑셀 잔재 스타일 제거: {', '.join(removed)}")
-        if not hwp.open(str(tmp2)):
+        if not open_document(hwp, tmp2):
             raise RuntimeError("후처리 파일을 다시 열지 못했습니다.")
         if os.path.exists(out):
             os.remove(out)
