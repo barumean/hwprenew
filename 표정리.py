@@ -80,11 +80,13 @@ class 규칙오류(Exception):
     pass
 
 
-def hex_to_hwp_color(hex_str: str) -> int:
+def hex_to_hwp_color(hex_str: str, 이름: str = None) -> int:
     """'#RRGGBB' → 한글 내부 색상값(BGR 정수)"""
-    s = hex_str.strip().lstrip("#")
+    s = str(hex_str).strip().lstrip("#")
     if not re.fullmatch(r"[0-9a-fA-F]{6}", s):
-        raise 규칙오류(f"색 값이 잘못되었습니다: '{hex_str}' (\"#RRGGBB\" 형식, 예: \"#000000\")")
+        where = f"[{이름}] " if 이름 else ""
+        raise 규칙오류(f"{where}색 값이 잘못되었습니다: '{hex_str}' "
+                     f'("#RRGGBB" 형식, 예: "#000000")')
     r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
     return r + g * 256 + b * 65536
 
@@ -94,17 +96,95 @@ def mm_to_hu(mm: float) -> int:
     return round(mm * 7200 / 25.4)
 
 
-def parse_line_rule(d: dict, 이름: str) -> dict:
-    """설정의 선 항목({종류, 굵기, 색}) → 내부 정수값"""
-    try:
-        종류 = LINE_TYPES[str(d.get("종류", "실선"))]
-        굵기 = LINE_WIDTHS[str(d.get("굵기", "0.12mm"))]
-        색 = hex_to_hwp_color(str(d.get("색", "#000000")))
-    except KeyError as e:
-        raise 규칙오류(f"[{이름}] 항목에 잘못된 값이 있습니다: {e}\n"
-                     f"  허용 선 종류: {', '.join(LINE_TYPES)}\n"
-                     f"  허용 선 굵기: {', '.join(LINE_WIDTHS)}")
-    return {"type": 종류, "width": 굵기, "color": 색}
+# 선 굵기: 숫자(mm)로도 찾을 수 있게 역인덱스를 만들어 둔다 (0.4 → "0.4mm")
+_WIDTH_BY_MM = {float(k[:-2]): v for k, v in LINE_WIDTHS.items()}
+
+
+def norm_line_type(value, 이름: str) -> int:
+    """선 종류 → 내부 코드. 이름('실선')과 내부 코드(0~11) 모두 허용."""
+    s = str(value).strip()
+    if s in LINE_TYPES:
+        return LINE_TYPES[s]
+    # 내부 코드가 그대로 저장된 파일(예: 종류: 0)도 읽어 준다
+    if not isinstance(value, bool) and re.fullmatch(r"\d+", s) and int(s) in LINE_TYPES.values():
+        return int(s)
+    raise 규칙오류(f"[{이름}] 선 종류 값이 잘못되었습니다: '{value}'\n"
+                 f"  허용 값: {', '.join(LINE_TYPES)}")
+
+
+def norm_line_width(value, 이름: str) -> int:
+    """선 굵기 → 내부 코드. '0.4mm', '0.4 mm', 0.4 모두 허용."""
+    s = str(value).strip().lower().replace(" ", "")
+    if s in LINE_WIDTHS:
+        return LINE_WIDTHS[s]
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(?:mm)?", s)
+    if m and float(m.group(1)) in _WIDTH_BY_MM:
+        return _WIDTH_BY_MM[float(m.group(1))]
+    # 내부 코드가 그대로 저장된 파일(예: 굵기: 6)도 읽어 준다.
+    # 단 'mm'을 붙여 쓴 값(9mm 등)은 굵기 목록에 없으면 그대로 오류.
+    if re.fullmatch(r"\d+", s) and int(s) in LINE_WIDTHS.values():
+        return int(s)
+    raise 규칙오류(f"[{이름}] 선 굵기 값이 잘못되었습니다: '{value}'\n"
+                 f"  허용 값: {', '.join(LINE_WIDTHS)}")
+
+
+def parse_line_rule(d, 이름: str) -> dict:
+    """설정의 선 항목({종류, 굵기, 색}) → 내부 정수값.
+
+    종류가 '없음'이면 굵기·색은 의미가 없으므로 아예 확인하지 않는다.
+    (설정 창에서도 '없음'이면 굵기·색 입력이 비활성화된다)"""
+    if not isinstance(d, dict):
+        d = {} if d is None else {"종류": d}    # "왼쪽: 없음" 처럼 한 줄로 쓴 경우
+    종류 = norm_line_type(d.get("종류", "실선"), 이름)
+    if 종류 == LINE_TYPES["없음"]:
+        return {"type": 0, "width": 0, "color": 0}
+    return {
+        "type": 종류,
+        "width": norm_line_width(d.get("굵기", "0.12mm"), 이름),
+        "color": hex_to_hwp_color(d.get("색", "#000000"), 이름),
+    }
+
+
+# 설정 파일에서 선(종류/굵기/색) 항목이 들어 있는 자리
+LINE_PATHS = (
+    ("표서식", "안쪽선"),
+    ("표서식", "바깥선", "위"),
+    ("표서식", "바깥선", "아래"),
+    ("표서식", "바깥선", "왼쪽"),
+    ("표서식", "바깥선", "오른쪽"),
+    ("표서식", "머리글행", "아래선"),
+    ("그림틀", "테두리"),
+)
+_TYPE_NAME_BY_CODE = {v: k for k, v in LINE_TYPES.items()}
+_WIDTH_NAME_BY_CODE = {v: k for k, v in LINE_WIDTHS.items()}
+
+
+def canonicalize_line_values(rules: dict) -> None:
+    """설정에 내부 코드(예: 종류: 0)나 '0.4' 같은 표기가 섞여 있어도
+    사람이 읽는 이름('없음', '0.4mm')으로 제자리에서 정리한다.
+    읽을 수 없는 값은 표준값으로 되돌린다. (설정 창에서 열면 자동 복구)"""
+    for path in LINE_PATHS:
+        node = rules
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            continue
+        try:
+            node["종류"] = _TYPE_NAME_BY_CODE[norm_line_type(node.get("종류", "실선"), "선")]
+        except 규칙오류:
+            node["종류"] = "실선"
+        if node["종류"] == "없음":      # 선 없음이면 굵기·색은 지운다
+            node.pop("굵기", None)
+            node.pop("색", None)
+            continue
+        try:
+            node["굵기"] = _WIDTH_NAME_BY_CODE[norm_line_width(node.get("굵기", "0.12mm"), "선")]
+        except 규칙오류:
+            node["굵기"] = "0.12mm"
+        try:
+            hex_to_hwp_color(node.get("색", "#000000"))
+        except 규칙오류:
+            node["색"] = "#000000"
 
 
 def parse_numbering_rule(value, 이름: str) -> int:
@@ -131,6 +211,7 @@ def parse_width_rule(value) -> dict:
 
 
 def load_rules(config_path: Path) -> dict:
+    """서식규칙.yaml을 읽어 내부 규칙으로 변환한다."""
     if not config_path.exists():
         raise 규칙오류(f"서식 규칙 파일을 찾을 수 없습니다: {config_path}")
     with open(config_path, encoding="utf-8") as f:
@@ -139,6 +220,16 @@ def load_rules(config_path: Path) -> dict:
         raw = {}
     if not isinstance(raw, dict):
         raise 규칙오류(f"서식 규칙 파일의 형식이 잘못되었습니다: {config_path}")
+    try:
+        return parse_rules(raw)
+    except 규칙오류 as e:
+        # 어느 파일을 고쳐야 하는지 함께 알려 준다
+        raise 규칙오류(f"{e}\n\n  파일: {config_path}\n"
+                     f"  (작업창의 [서식 설정]에서 값을 고른 뒤 저장하면 바로잡힙니다)")
+
+
+def parse_rules(raw: dict) -> dict:
+    """규칙 dict(서식규칙.yaml 내용) → 내부 규칙. 잘못된 값은 규칙오류."""
     표 = raw.get("표서식") or {}
 
     바깥 = 표.get("바깥선") or {}
@@ -163,7 +254,7 @@ def load_rules(config_path: Path) -> dict:
         except (TypeError, ValueError):
             raise 규칙오류(f"[머리글행] 행수 값이 잘못되었습니다: "
                          f"'{머리글.get('행수')}' (숫자를 입력하세요)")
-        rules["header_fill"] = hex_to_hwp_color(str(머리글.get("배경색", "#CCCCCC")))
+        rules["header_fill"] = hex_to_hwp_color(머리글.get("배경색", "#CCCCCC"), "머리글행.배경색")
         아래선 = 머리글.get("아래선")
         if 아래선:
             rules["header_bottom"] = parse_line_rule(아래선, "머리글행.아래선")
@@ -1106,7 +1197,11 @@ if _TK_OK:
             if self.config_path.exists():
                 with open(self.config_path, encoding="utf-8") as f:
                     user = yaml.safe_load(f) or {}
-            return _deep_merge(DEFAULT_RULES, user)
+                if not isinstance(user, dict):
+                    user = {}
+            merged = _deep_merge(DEFAULT_RULES, user)
+            canonicalize_line_values(merged)     # 잘못된 값은 표준값으로 자동 복구
+            return merged
 
         def _build_ui(self):
             root = ttk.Frame(self, padding=14)
@@ -1315,6 +1410,9 @@ if _TK_OK:
                     if isinstance(node, dict) and str(node.get("종류")) == "없음":
                         node.pop("굵기", None)
                         node.pop("색", None)
+                # 저장 전에 엔진과 같은 방식으로 검증한다. 여기서 걸러야
+                # 정리 실행 도중 규칙오류로 멈추는 일이 없다.
+                parse_rules(self.rules)
                 with open(self.config_path, "w", encoding="utf-8") as f:
                     yaml.safe_dump(self.rules, f, allow_unicode=True, sort_keys=False)
             except Exception as exc:
