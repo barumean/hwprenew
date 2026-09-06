@@ -379,7 +379,95 @@ except RuntimeError as e:
 check("진단 문자열에 셀 상태 포함", "셀안=" in m.cell_entry_diagnosis(FakeHwp()))
 
 # ══════════════════════════════════════════════════════════════
-print("\n[9] 처리 대상 수집 (파일·폴더)")
+print("\n[9] 글자 서식 · 표 위치 · 캡션")
+check("저장소 규칙: 표 안 글자 서식 사용", rules["cell_text"]["use"] is True)
+check("머리글행 = 표위타이틀 + 가운데 정렬",
+      rules["cell_text"]["header"]["style"] == "표위타이틀"
+      and rules["cell_text"]["header"]["align"] == "ParagraphShapeAlignCenter")
+check("본문셀 = 표내용 + 정렬 유지",
+      rules["cell_text"]["body"]["style"] == "표내용"
+      and rules["cell_text"]["body"]["align"] is None)
+check("표 위치 = 가운데", rules["table_pos"]["align"] == "ParagraphShapeAlignCenter")
+check("캡션(표) = 위 + 번호 + 표-번호제목",
+      rules["caption"]["table"]["use"] and rules["caption"]["table"]["side"] == "Top"
+      and rules["caption"]["table"]["number"]
+      and rules["caption"]["table"]["text"]["style"] == "표-번호제목")
+check("캡션(그림틀) = 아래 + 그림-번호제목",
+      rules["caption"]["frame"]["side"] == "Bottom"
+      and rules["caption"]["frame"]["text"]["style"] == "그림-번호제목")
+check("쓰는 스타일 목록",
+      m.wanted_style_names(rules) == ["표위타이틀", "표내용", "표-번호제목", "그림-번호제목"])
+
+r = m.parse_text_rule({"글꼴": "KoPubWorld돋움체 Bold", "크기": "11pt",
+                       "진하게": "켬", "정렬": "배분"}, "테스트")
+check("직접 지정(글꼴·크기·진하게·정렬) 파싱",
+      r["font"] == "KoPubWorld돋움체 Bold" and r["size"] == 11.0
+      and r["bold"] is True and r["align"] == "ParagraphShapeAlignDistribute")
+check("크기는 pt 없이도 인식", m.parse_text_rule({"크기": "10"}, "t")["size"] == 10.0)
+check("모두 '유지'면 아무것도 안 함", m.text_rule_is_noop(m.parse_text_rule({}, "t")))
+check("하나라도 지정되면 적용 대상",
+      not m.text_rule_is_noop(m.parse_text_rule({"정렬": "가운데"}, "t")))
+raises("잘못된 정렬", lambda: m.parse_text_rule({"정렬": "중앙"}, "t"), "정렬 값")
+raises("잘못된 크기", lambda: m.parse_text_rule({"크기": "열한"}, "t"), "글자 크기")
+raises("잘못된 진하게", lambda: m.parse_text_rule({"진하게": "예"}, "t"), "진하게")
+raises("잘못된 캡션 위치", lambda: m.parse_caption_rule({"위치": "옆"}, "캡션.표"), "위치 값")
+raises("잘못된 캡션 사용", lambda: m.parse_caption_rule({"사용": "예"}, "캡션.표"), "사용 값")
+
+# 스타일 이름 → 번호 표
+hdr_st = ('<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">'
+          '<hh:styles><hh:style id="0" name="바탕글"/>'
+          '<hh:style id="5" name="표위타이틀"/></hh:styles></hh:head>')
+p5 = Path(tempfile.mktemp(suffix=".hwpx"))
+make_hwpx(p5, hdr_st, f'<hp:sec xmlns:hp="{HP}"/>')
+with zipfile.ZipFile(p5) as z:
+    ids = m.read_style_ids(z)
+p5.unlink()
+check("스타일 이름→번호 읽기", ids == {"바탕글": 0, "표위타이틀": 5})
+
+# 캡션 유무 인식
+tbl_no = ET.fromstring(f'<hp:tbl xmlns:hp="{HP}" rowCnt="1" colCnt="1">{cell(0,0)}</hp:tbl>')
+tbl_yes = ET.fromstring(f'<hp:tbl xmlns:hp="{HP}" rowCnt="1" colCnt="1">'
+                        f'<hp:caption/>{cell(0,0)}</hp:tbl>')
+check("캡션 없는 표 인식", m.TableSpec(tbl_no).has_caption is False)
+check("캡션 있는 표 인식", m.TableSpec(tbl_yes).has_caption is True)
+
+
+class FakeText:
+    """set_style / set_font / 정렬 액션 호출을 기록하는 가짜 한글."""
+
+    def __init__(self):
+        self.styles = []
+        self.fonts = []
+        self.runs = []
+        outer = self
+
+        class A:
+            def Run(self, name):
+                outer.runs.append(name)
+        self.HAction = A()
+
+    def set_style(self, sid):
+        self.styles.append(sid)
+
+    def set_font(self, **kw):
+        self.fonts.append(kw)
+
+
+h = FakeText()
+m.apply_text_rule(h, m.parse_text_rule(
+    {"스타일": "표위타이틀", "글꼴": "돋움", "크기": "11pt", "진하게": "켬", "정렬": "가운데"}, "t"),
+    {"표위타이틀": 5})
+check("스타일 번호로 적용", h.styles == [5])
+check("글꼴·크기·진하게 적용",
+      h.fonts == [{"FaceName": "돋움", "Height": 11.0, "Bold": True}])
+check("정렬 액션 실행", h.runs == ["ParagraphShapeAlignCenter"])
+
+h = FakeText()
+m.apply_text_rule(h, m.parse_text_rule({"스타일": "없는스타일"}, "t"), {"표내용": 1})
+check("문서에 없는 스타일은 건너뜀", h.styles == [] and h.fonts == [] and h.runs == [])
+
+# ══════════════════════════════════════════════════════════════
+print("\n[10] 처리 대상 수집 (파일·폴더)")
 tdir = Path(tempfile.mkdtemp())
 for name in ("a.hwp", "b.HWPX", "c_정리본.hwp", "_표정리_후처리.hwpx", "d.txt"):
     (tdir / name).write_text("")
@@ -392,7 +480,7 @@ check("직접 지정한 정리본은 존중 + 중복 제거",
       == ["c_정리본.hwp", "a.hwp", "b.HWPX"])
 
 # ══════════════════════════════════════════════════════════════
-print("\n[10] 여러 문서 일괄 처리 (run_batch)")
+print("\n[11] 여러 문서 일괄 처리 (run_batch)")
 calls = []
 
 

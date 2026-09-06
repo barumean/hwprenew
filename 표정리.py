@@ -187,6 +187,74 @@ def canonicalize_line_values(rules: dict) -> None:
             node["색"] = "#000000"
 
 
+# 문단 정렬 이름 → 한글 액션 이름
+ALIGN_ACTIONS = {
+    "왼쪽": "ParagraphShapeAlignLeft",
+    "가운데": "ParagraphShapeAlignCenter",
+    "오른쪽": "ParagraphShapeAlignRight",
+    "양쪽": "ParagraphShapeAlignJustify",
+    "배분": "ParagraphShapeAlignDistribute",
+    "나눔": "ParagraphShapeAlignDivision",
+}
+CAPTION_SIDES = {"위": "Top", "아래": "Bottom", "왼쪽": "Left", "오른쪽": "Right", "유지": None}
+
+
+def parse_text_rule(d, 이름: str) -> dict:
+    """글자·문단 서식 항목({스타일, 글꼴, 크기, 진하게, 정렬}) 파싱.
+    값이 '유지'면 그 항목은 건드리지 않는다."""
+    if not isinstance(d, dict):
+        d = {}
+
+    def 지정(키, 기본="유지"):
+        v = d.get(키, 기본)
+        return None if str(v).strip() in ("유지", "") else v
+
+    정렬 = 지정("정렬")
+    if 정렬 is not None and str(정렬).strip() not in ALIGN_ACTIONS:
+        raise 규칙오류(f"[{이름}] 정렬 값이 잘못되었습니다: '{정렬}'\n"
+                     f"  허용 값: 유지, {', '.join(ALIGN_ACTIONS)}")
+    크기 = 지정("크기")
+    if 크기 is not None:
+        mo = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:pt|포인트)?", str(크기).strip(), re.I)
+        if not mo:
+            raise 규칙오류(f"[{이름}] 글자 크기 값이 잘못되었습니다: '{크기}' (예: 11pt)")
+        크기 = float(mo.group(1))
+    진하게 = str(d.get("진하게", "유지")).strip()
+    if 진하게 not in ("켬", "끔", "유지"):
+        raise 규칙오류(f"[{이름}] 진하게 값이 잘못되었습니다: '{진하게}' (허용: 켬, 끔, 유지)")
+    스타일 = 지정("스타일")
+    return {
+        "style": str(스타일).strip() if 스타일 is not None else None,
+        "font": str(지정("글꼴")).strip() if 지정("글꼴") is not None else None,
+        "size": 크기,
+        "bold": {"켬": True, "끔": False}.get(진하게),
+        "align": ALIGN_ACTIONS[str(정렬).strip()] if 정렬 is not None else None,
+    }
+
+
+def text_rule_is_noop(rule) -> bool:
+    """아무것도 바꾸지 않는(모두 '유지') 서식 규칙인가?"""
+    return not (rule["style"] or rule["font"] or rule["size"]
+                or rule["bold"] is not None or rule["align"])
+
+
+def parse_caption_rule(d, 이름: str) -> dict:
+    """캡션 항목({사용, 위치, 번호, 글자}) 파싱"""
+    if not isinstance(d, dict):
+        d = {}
+    사용 = str(d.get("사용", "끔")).strip()
+    번호 = str(d.get("번호", "켬")).strip()
+    for 값, 키 in ((사용, "사용"), (번호, "번호")):
+        if 값 not in ("켬", "끔"):
+            raise 규칙오류(f"[{이름}] {키} 값이 잘못되었습니다: '{값}' (허용: 켬, 끔)")
+    위치 = str(d.get("위치", "위")).strip()
+    if 위치 not in CAPTION_SIDES:
+        raise 규칙오류(f"[{이름}] 위치 값이 잘못되었습니다: '{위치}'\n"
+                     f"  허용 값: {', '.join(CAPTION_SIDES)}")
+    return {"use": 사용 == "켬", "side": CAPTION_SIDES[위치], "number": 번호 == "켬",
+            "text": parse_text_rule(d.get("글자"), f"{이름}.글자")}
+
+
 def parse_numbering_rule(value, 이름: str) -> int:
     """번호종류 값(없음/그림/표/수식) → 내부 정수값"""
     s = str(value)
@@ -281,10 +349,44 @@ def parse_rules(raw: dict) -> dict:
         raise 규칙오류(f"[개체위치] 글자처럼취급 값이 잘못되었습니다: '{취급}' (허용: 켬, 끔, 유지)")
     rules["treat_as_char"] = {"켬": 1, "끔": 0}.get(취급)
 
+    # 표 안 글자 서식 (머리글행 / 본문셀)
+    글자 = raw.get("글자서식") or {}
+    사용 = str(글자.get("사용", "끔")).strip()
+    if 사용 not in ("켬", "끔"):
+        raise 규칙오류(f"[글자서식] 사용 값이 잘못되었습니다: '{사용}' (허용: 켬, 끔)")
+    rules["cell_text"] = {
+        "use": 사용 == "켬",
+        "header": parse_text_rule(글자.get("머리글행"), "글자서식.머리글행"),
+        "body": parse_text_rule(글자.get("본문셀"), "글자서식.본문셀"),
+    }
+
+    # 표의 좌우 위치 = 표가 놓인 문단의 정렬/스타일
+    rules["table_pos"] = parse_text_rule(raw.get("표위치"), "표위치")
+
+    # 캡션(번호 제목)
+    캡션 = raw.get("캡션") or {}
+    rules["caption"] = {
+        "table": parse_caption_rule(캡션.get("표"), "캡션.표"),
+        "frame": parse_caption_rule(캡션.get("그림틀"), "캡션.그림틀"),
+    }
+
     # 스타일 정리
     스타일 = raw.get("스타일정리") or {}
     rules["remove_x_styles"] = str(스타일.get("x스타일제거", "켬")) == "켬"
     return rules
+
+
+def wanted_style_names(rules) -> list:
+    """규칙에서 쓰기로 한 스타일 이름 목록(중복 제거, 순서 유지)."""
+    이름들 = [rules["table_pos"]["style"],
+             rules["cell_text"]["header"]["style"], rules["cell_text"]["body"]["style"],
+             rules["caption"]["table"]["text"]["style"],
+             rules["caption"]["frame"]["text"]["style"]]
+    본 = []
+    for n in 이름들:
+        if n and n not in 본:
+            본.append(n)
+    return 본
 
 
 # ------------------------------------------------------------------
@@ -303,6 +405,9 @@ class TableSpec:
     def __init__(self, tbl_el):
         self.n_rows = int(tbl_el.get("rowCnt"))
         self.n_cols = int(tbl_el.get("colCnt"))
+        # 이미 캡션이 달려 있는지(있으면 새로 만들지 않고 서식만 맞춘다)
+        self.has_caption = tbl_el.find(f"{HP}caption") is not None
+        self.nested = False
         self.cells = {}
         for tr in tbl_el.findall(f"{HP}tr"):          # 직계 행만 (중첩 표 제외)
             for tc in tr.findall(f"{HP}tc"):
@@ -345,14 +450,31 @@ def nested_tbl_ids(section) -> set:
     return nested
 
 
-def analyze_tables(hwp, src: Path) -> list:
-    """열려 있는 문서를 임시 hwpx로 저장해 표 구조 목록을 만든다(문서 순서)."""
+def read_style_ids(z) -> dict:
+    """header.xml에서 '스타일 이름 → 스타일 번호' 표를 만든다.
+
+    (pyhwpx의 set_style(이름)은 내부적으로 임시 파일을 만들기 때문에
+    이름 대신 번호로 지정하려고 미리 읽어 둔다)"""
+    HH = "{http://www.hancom.co.kr/hwpml/2011/head}"
+    header = ET.fromstring(z.read("Contents/header.xml"))
+    ids = {}
+    for st in header.iter(f"{HH}style"):
+        name = st.get("name")
+        if name and st.get("id") is not None:
+            ids[name] = int(st.get("id"))
+    return ids
+
+
+def analyze_tables(hwp, src: Path):
+    """열려 있는 문서를 임시 hwpx로 저장해 표 구조 목록과
+    스타일 이름→번호 표를 만든다(표는 문서 순서)."""
     tmp = make_temp_path(src.parent, "_표정리_분석용")
     if not hwp.save_as(str(tmp), format="HWPX"):
         raise RuntimeError("분석용 임시 저장에 실패했습니다.")
     try:
         specs = []
         with zipfile.ZipFile(tmp) as z:
+            style_ids = read_style_ids(z)
             for name in sorted(n for n in z.namelist()
                                if re.fullmatch(r"Contents/section\d+\.xml", n)):
                 section = ET.fromstring(z.read(name))
@@ -361,7 +483,7 @@ def analyze_tables(hwp, src: Path) -> list:
                     spec = TableSpec(tbl)
                     spec.nested = id(tbl) in nested   # 중첩 표는 너비 조절 제외
                     specs.append(spec)
-        return specs
+        return specs, style_ids
     finally:
         # save_as 이후에는 임시 파일이 '현재 문서'가 되어 잠겨 있으므로
         # 원본을 다시 열어 잠금을 풀고 임시 파일을 지운다.
@@ -696,7 +818,7 @@ def walk_cells(hwp, max_steps: int):
         hwp.HAction.Run("TableRightCell")
 
 
-def apply_cell(hwp, sides: dict, fill):
+def apply_cell(hwp, sides: dict, fill, text=None, style_ids=None):
     """캐럿이 있는 셀 하나에 테두리 4방향과 배경을 적용.
     fill: 색상 정수(칠하기) / "clear"(지우기) / None(그대로 둠)
 
@@ -728,6 +850,72 @@ def apply_cell(hwp, sides: dict, fill):
         hwp.HAction.Execute("CellFill", pset.HSet)
 
     hwp.HAction.Run("Cancel")
+
+    # 셀 안 글자 서식 (블록을 새로 잡아 적용한다 — 위 블록에 이어서 하면
+    # TableCellBlock이 선택 영역을 넓혀 옆 셀까지 번질 수 있다)
+    if text is not None and not text_rule_is_noop(text):
+        hwp.HAction.Run("TableCellBlock")
+        try:
+            apply_text_rule(hwp, text, style_ids or {})
+        finally:
+            hwp.HAction.Run("Cancel")
+
+
+def apply_text_rule(hwp, rule, style_ids: dict) -> None:
+    """현재 선택 영역(또는 캐럿 문단)에 글자·문단 서식을 적용한다."""
+    if rule["style"]:
+        번호 = style_ids.get(rule["style"])
+        if 번호 is not None:            # 문서에 없는 스타일이면 건너뛴다
+            hwp.set_style(번호)
+    kw = {}
+    if rule["font"]:
+        kw["FaceName"] = rule["font"]
+    if rule["size"]:
+        kw["Height"] = rule["size"]
+    if rule["bold"] is not None:
+        kw["Bold"] = rule["bold"]
+    if kw:
+        hwp.set_font(**kw)
+    if rule["align"]:
+        hwp.HAction.Run(rule["align"])
+
+
+def apply_table_position(hwp, ctrl, rule, style_ids: dict) -> bool:
+    """표가 놓인 문단의 정렬·스타일을 맞춘다(= 표의 좌우 위치).
+
+    글자처럼 취급된 표는 문단 정렬이 곧 표의 좌우 위치가 된다."""
+    if text_rule_is_noop(rule):
+        return False
+    hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+    apply_text_rule(hwp, rule, style_ids)
+    return True
+
+
+def ensure_caption(hwp, ctrl, rule, style_ids: dict, has_caption: bool) -> bool:
+    """캡션(번호 제목)이 없으면 만들고, 글자 서식과 위치를 맞춘다.
+
+    새로 만들었으면 True. 이미 있으면 내용은 그대로 두고 서식만 맞춘다."""
+    if not rule["use"]:
+        return False
+    hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+    hwp.hwp.FindCtrl()
+    # 캡션이 없으면 새로 만들고, 있으면 그 캡션 안으로 들어간다
+    hwp.HAction.Run("ShapeObjAttachCaption")
+    try:
+        if not has_caption and rule["number"]:
+            hwp.HAction.Run("ShapeObjInsertCaptionNum")     # "표 1" 같은 번호
+        if not text_rule_is_noop(rule["text"]):
+            apply_text_rule(hwp, rule["text"], style_ids)
+    finally:
+        hwp.HAction.Run("CloseEx")                          # 캡션 편집 끝내기
+    if rule["side"]:                                        # 캡션 위치(위/아래)
+        hwp.set_pos_by_set(ctrl.GetAnchorPos(0))
+        hwp.hwp.FindCtrl()
+        pset = hwp.HParameterSet.HShapeObject
+        hwp.HAction.GetDefault("TablePropertyDialog", pset.HSet)
+        pset.ShapeCaption.Side = hwp.hwp.SideType(rule["side"])
+        hwp.HAction.Execute("TablePropertyDialog", pset.HSet)
+    return not has_caption
 
 
 def cell_plan(spec: TableSpec, addr, rules):
@@ -891,16 +1079,40 @@ def format_frame(hwp, ctrl, rules) -> None:
         set_numbering_type(ctrl, frame["numbering"])
 
 
-def format_table(hwp, ctrl, spec: TableSpec, rules) -> int:
+def extras(hwp, ctrl, spec, rules, style_ids, 종류: str):
+    """표 위치와 캡션을 적용한다. (적용한 위치 수, 새로 만든 캡션 수) 반환.
+
+    테두리·배경 정리와는 별개의 부가 작업이라, 실패해도 표 전체를
+    실패로 만들지 않고 경고만 남긴다."""
+    위치수 = 캡션수 = 0
+    try:
+        if apply_table_position(hwp, ctrl, rules["table_pos"], style_ids):
+            위치수 = 1
+    except Exception as e:
+        print(f"      ※ 표 위치 조정 실패({type(e).__name__}: {e})")
+    try:
+        if ensure_caption(hwp, ctrl, rules["caption"][종류], style_ids, spec.has_caption):
+            캡션수 = 1
+    except Exception as e:
+        print(f"      ※ 캡션 처리 실패({type(e).__name__}: {e})")
+    return 위치수, 캡션수
+
+
+def format_table(hwp, ctrl, spec: TableSpec, rules, style_ids=None) -> int:
     """표 하나를 셀 단위로 정리. 처리한 셀 수를 반환."""
     enter_table(hwp, ctrl)
     done = 0
+    글자 = rules["cell_text"]
+    머리글 = rules["header_rows"] if spec.n_rows > rules["header_rows"] else 0
     max_steps = 4 * len(spec.cells) + 16
     for addr in walk_cells(hwp, max_steps):
         if addr not in spec.cells:      # 구조 분석과 불일치 → 안전하게 중단
             raise RuntimeError(f"셀 주소 불일치: {addr}")
         sides, fill = cell_plan(spec, addr, rules)
-        apply_cell(hwp, sides, fill)
+        text = None
+        if 글자["use"]:
+            text = 글자["header"] if addr[0] < 머리글 else 글자["body"]
+        apply_cell(hwp, sides, fill, text, style_ids)
         done += 1
     if done != len(spec.cells):
         raise RuntimeError(f"셀 {len(spec.cells)}개 중 {done}개만 방문됨")
@@ -1000,7 +1212,11 @@ def process(src: Path, visible: bool = False) -> Path:
             raise RuntimeError("문서를 열 수 없습니다. (암호/배포용 문서이거나 다른 프로그램에서 사용 중일 수 있습니다)")
 
         print("문서 열기 완료 — 표 구조 분석 중...", flush=True)
-        specs = analyze_tables(hwp, src)
+        specs, style_ids = analyze_tables(hwp, src)
+        빠진스타일 = [n for n in wanted_style_names(rules) if n not in style_ids]
+        if 빠진스타일:
+            print(f"  ※ 이 문서에 없는 스타일은 건너뜁니다: {', '.join(빠진스타일)}\n"
+                  f"    (한글에서 서식 파일(.sty)을 먼저 불러오면 적용됩니다)")
         ctrls = collect_tables(hwp)
         if len(specs) != len(ctrls):
             raise RuntimeError(f"표 개수 불일치(분석 {len(specs)} vs 문서 {len(ctrls)}) — 처리를 중단합니다.")
@@ -1024,6 +1240,7 @@ def process(src: Path, visible: bool = False) -> Path:
         photo_target = width_target(pw)
 
         done = frames = resized = failed = 0
+        captions = positioned = 0
         failed_idx = set()              # 실패한 표의 순번(0-기준) — 후처리에서 제외
         for i, (ctrl, spec) in enumerate(zip(ctrls, specs), start=1):
             label = f"[{i}/{len(ctrls)}] {spec.n_rows}행x{spec.n_cols}열"
@@ -1035,6 +1252,9 @@ def process(src: Path, visible: bool = False) -> Path:
                         print(f"  {label} — 그림틀 → 건너뜀(규칙)")
                     else:
                         format_frame(hwp, ctrl, rules)
+                        p_ok, c_ok = extras(hwp, ctrl, spec, rules, style_ids, "frame")
+                        positioned += p_ok
+                        captions += c_ok
                         w_ok = (can_resize and frame_target is not None
                                 and resize_table(hwp, ctrl, frame_target,
                                                  fit_doc=fw["mode"] == "doc_width"))
@@ -1043,7 +1263,10 @@ def process(src: Path, visible: bool = False) -> Path:
                         frames += 1
                         print(f"  {label} — 그림틀 서식 적용" + ("＋너비조절" if w_ok else ""))
                     continue
-                n = format_table(hwp, ctrl, spec, rules)
+                n = format_table(hwp, ctrl, spec, rules, style_ids)
+                p_ok, c_ok = extras(hwp, ctrl, spec, rules, style_ids, "table")
+                positioned += p_ok
+                captions += c_ok
                 w_ok = (can_resize and table_target is not None
                         and resize_table(hwp, ctrl, table_target,
                                          fit_doc=tw["mode"] == "doc_width"))
@@ -1120,6 +1343,8 @@ def process(src: Path, visible: bool = False) -> Path:
         if not hwp.save_as(str(out), format=fmt):
             raise RuntimeError("저장에 실패했습니다.")
         # tmp2 삭제는 한글 종료 후(잠금 해제 확실)의 finally에서 수행한다.
+        if captions or positioned:
+            print(f"  캡션 새로 넣음 {captions}개 / 표 위치 조정 {positioned}개")
         print(f"\n완료: 표 {done}개 / 그림틀 {frames}개 / 너비조절 {resized}개 / 사진 {photos}개 / 실패 {failed}개")
         print(f"저장 위치: {out}")
         return out
@@ -1208,6 +1433,18 @@ DEFAULT_RULES = {
         "배경": "지우기", "번호종류": "그림",
     },
     "사진": {"번호종류": "없음", "너비": "유지"},
+    "글자서식": {
+        "사용": "켬",
+        "머리글행": {"스타일": "표위타이틀", "정렬": "가운데"},
+        "본문셀": {"스타일": "표내용", "정렬": "유지"},
+    },
+    "표위치": {"정렬": "가운데", "스타일": "유지"},
+    "캡션": {
+        "표": {"사용": "켬", "위치": "위", "번호": "켬",
+              "글자": {"스타일": "표-번호제목", "정렬": "유지"}},
+        "그림틀": {"사용": "켬", "위치": "아래", "번호": "켬",
+                 "글자": {"스타일": "그림-번호제목", "정렬": "유지"}},
+    },
     "개체위치": {"글자처럼취급": "켬"},
     "스타일정리": {"x스타일제거": "켬"},
 }
@@ -1236,6 +1473,11 @@ if _TK_OK:
     _ON_OFF_KEEP = ["켬", "끔", "유지"]
     _ON_OFF = ["켬", "끔"]
     _CLEAR_KEEP = ["지우기", "유지"]
+    _ALIGN_VALUES = ["유지"] + list(ALIGN_ACTIONS)
+    _SIDE_VALUES = list(CAPTION_SIDES)
+    # 표준 서식(.sty)에 들어 있는 표 관련 스타일 이름 — 직접 입력도 가능
+    _STYLE_NAMES = ["유지", "표위타이틀", "표왼타이틀", "표내용", "표내용(가운데)",
+                    "표-번호제목", "그림-번호제목", "표-그림위치", "자료", "바탕글"]
 
     class RuleEditor(tk.Toplevel):
         """서식규칙.yaml의 자주 쓰는 항목을 폼으로 편집하는 설정 창."""
@@ -1280,6 +1522,7 @@ if _TK_OK:
             self._build_table_tab(notebook)
             self._build_frame_tab(notebook)
             self._build_object_tab(notebook)
+            self._build_cell_text_tab(notebook)
             self._build_text_style_tab(notebook)
             self._build_raw_tab(notebook)
 
@@ -1334,6 +1577,54 @@ if _TK_OK:
             self._combo_row(tab, "사진 너비", ("사진", "너비"), 사진["너비"], _WIDTH_VALUES, 1,
                             "너비를 바꾸면 높이는 비율 유지로 자동 조절")
             self._combo_row(tab, "글자처럼 취급", ("개체위치", "글자처럼취급"), 개체["글자처럼취급"], _ON_OFF_KEEP, 2)
+            tab.columnconfigure(1, weight=1)
+
+        def _build_cell_text_tab(self, notebook):
+            """표 안 글자 서식 · 표 위치 · 캡션"""
+            tab = ttk.Frame(notebook, padding=12)
+            notebook.add(tab, text="글자·캡션")
+            글자 = self.rules["글자서식"]
+            머리 = 글자.get("머리글행") or {}
+            본문 = 글자.get("본문셀") or {}
+            위치 = self.rules["표위치"]
+            캡션 = self.rules["캡션"]
+
+            self._combo_row(tab, "표 안 글자 서식", ("글자서식", "사용"),
+                            글자.get("사용", "켬"), _ON_OFF, 0,
+                            "스타일은 그 이름이 문서에 있을 때만 적용됩니다")
+            for row, (제목, 경로, 값) in enumerate((
+                    ("머리글 행", ("글자서식", "머리글행"), 머리),
+                    ("본문 셀", ("글자서식", "본문셀"), 본문)), start=1):
+                box = ttk.LabelFrame(tab, text=제목)
+                box.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+                self._combo_row(box, "스타일", 경로 + ("스타일",),
+                                값.get("스타일", "유지"), _STYLE_NAMES, 0)
+                self._combo_row(box, "정렬", 경로 + ("정렬",),
+                                값.get("정렬", "유지"), _ALIGN_VALUES, 1)
+                box.columnconfigure(1, weight=1)
+
+            box = ttk.LabelFrame(tab, text="표 위치 (표가 놓인 문단의 정렬)")
+            box.grid(row=3, column=0, columnspan=3, sticky="ew", pady=4)
+            self._combo_row(box, "정렬", ("표위치", "정렬"), 위치.get("정렬", "가운데"),
+                            _ALIGN_VALUES, 0)
+            self._combo_row(box, "스타일", ("표위치", "스타일"), 위치.get("스타일", "유지"),
+                            _STYLE_NAMES, 1)
+            box.columnconfigure(1, weight=1)
+
+            for row, (key, 기본위치) in enumerate((("표", "위"), ("그림틀", "아래")), start=4):
+                항목 = 캡션.get(key) or {}
+                글 = 항목.get("글자") or {}
+                box = ttk.LabelFrame(tab, text=f"캡션 — {key}")
+                box.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+                self._combo_row(box, "사용", ("캡션", key, "사용"),
+                                항목.get("사용", "켬"), _ON_OFF, 0)
+                self._combo_row(box, "위치", ("캡션", key, "위치"),
+                                항목.get("위치", 기본위치), _SIDE_VALUES, 1)
+                self._combo_row(box, "번호 넣기", ("캡션", key, "번호"),
+                                항목.get("번호", "켬"), _ON_OFF, 2)
+                self._combo_row(box, "스타일", ("캡션", key, "글자", "스타일"),
+                                글.get("스타일", "유지"), _STYLE_NAMES, 3)
+                box.columnconfigure(1, weight=1)
             tab.columnconfigure(1, weight=1)
 
         def _build_text_style_tab(self, notebook):
